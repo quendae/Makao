@@ -2,6 +2,8 @@
 // It deliberately does not contain Makao rules or networking authority.
 
 export function installUxEffects(game, ui) {
+  installUnifiedCardGeometry();
+
   let previous = snapshot(game.state);
   let localPlaySources = [];
 
@@ -65,6 +67,18 @@ export function installUxEffects(game, ui) {
     compressHumanHand(hand);
     enhanceChoicePanel(game.state);
   });
+}
+
+function installUnifiedCardGeometry() {
+  if (document.getElementById('unified-card-geometry')) return;
+  const style = document.createElement('style');
+  style.id = 'unified-card-geometry';
+  style.textContent = `
+    /* One physical geometry for every full-size card. Mini opponent backs stay compact. */
+    .table-card { --cardw: inherit; --cardh: inherit; }
+    .card-back:not(.mini-back) { width: var(--cardw); height: var(--cardh); }
+  `;
+  document.head.appendChild(style);
 }
 
 function snapshot(state) {
@@ -238,6 +252,16 @@ function elementRotation(element) {
   }
 }
 
+function fullCardSize() {
+  const style = getComputedStyle(document.documentElement);
+  const width = parseFloat(style.getPropertyValue('--cardw'));
+  const height = parseFloat(style.getPropertyValue('--cardh'));
+  return {
+    width: Number.isFinite(width) && width > 0 ? width : 102,
+    height: Number.isFinite(height) && height > 0 ? height : 145,
+  };
+}
+
 function humanSourceGeometry(hand) {
   const selected = hand?.querySelector('.hand-card.selected');
   const any = selected ?? hand?.querySelector('.hand-card');
@@ -283,18 +307,14 @@ function discardTargetRect(discard) {
 
 function flyFaceCard(ui, card, from, to, onFinish = null) {
   const element = ui.makeCard(card, { table: true });
-  const compact = window.innerWidth <= 820;
-  prepareFlight(element, from, to, 0, {
-    width: compact ? 78 : 106,
-    height: compact ? 110 : 152,
-  }, onFinish);
+  prepareFlight(element, from, to, 0, fullCardSize(), onFinish);
 }
 
 function flyBackCard(from, to) {
   const element = document.createElement('div');
   element.className = 'card card-back';
   element.innerHTML = '<div class="back-inner"><span>MAKAO</span></div>';
-  prepareFlight(element, from, to, 0);
+  prepareFlight(element, from, to, 0, fullCardSize());
 }
 
 function prepareFlight(element, from, to, endRotation = 0, size = null, onFinish = null) {
@@ -327,8 +347,8 @@ function prepareFlight(element, from, to, endRotation = 0, size = null, onFinish
   requestAnimationFrame(() => {
     requestAnimationFrame(() => {
       element.classList.add('is-flying');
-      element.style.transform = `translate(${dx}px, ${dy}px) rotate(${endRotation}deg) scale(.96)`;
-      element.style.opacity = '.9';
+      element.style.transform = `translate(${dx}px, ${dy}px) rotate(${endRotation}deg) scale(1)`;
+      element.style.opacity = '1';
     });
   });
 
