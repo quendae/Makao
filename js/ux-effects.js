@@ -3,7 +3,7 @@
 
 export function installUxEffects(game, ui) {
   let previous = snapshot(game.state);
-  let localPlayRects = [];
+  let localPlaySources = [];
 
   const playButton = document.getElementById('play-btn');
   const hand = document.getElementById('human-hand');
@@ -13,25 +13,51 @@ export function installUxEffects(game, ui) {
   const motionToggle = document.getElementById('motion-toggle');
 
   playButton?.addEventListener('click', () => {
-    localPlayRects = [...hand.querySelectorAll('.hand-card.selected')]
-      .map((element) => element.getBoundingClientRect())
-      .sort((a, b) => a.left - b.left);
+    localPlaySources = [...hand.querySelectorAll('.hand-card.selected')]
+      .map((element) => elementGeometry(element))
+      .filter(Boolean)
+      .sort((a, b) => a.rect.left - b.rect.left);
   }, true);
 
-  // Preserve the bootstrap callback. In multiplayer it renders the state and,
-  // on the host, broadcasts a seat-filtered authoritative view.
+  // Preserve the bootstrap callback. State is rendered immediately, but a new
+  // discard card can be held back while its flight is still visible. This
+  // prevents the landed card and the transient flight card from flashing at
+  // the same time.
   const baseOnChange = game.onChange;
   game.onChange = (state) => {
     const before = previous;
+    const next = snapshot(state);
+    const discardDelta = next.discardCount - before.discardCount;
+    const canAnimate = before?.started && state.started && motionEnabled(motionToggle);
+    const opponentSources = captureOpponentSources(opponents, state, game.localSeat);
+    const drawSource = elementGeometry(drawPile);
+
+    if (canAnimate && discardDelta > 0) {
+      ui.beginDiscardFlight?.(state.discardPile.at(-1));
+    }
+
     baseOnChange(state);
     enhanceChoicePanel(state);
 
     requestAnimationFrame(() => {
       compressHumanHand(hand);
-      animateStateChange({ before, state, game, ui, hand, drawPile, discard, opponents, motionToggle, localPlayRects });
-      localPlayRects = [];
+      animateStateChange({
+        before,
+        state,
+        game,
+        ui,
+        hand,
+        drawPile,
+        discard,
+        opponents,
+        motionToggle,
+        localPlaySources,
+        opponentSources,
+        drawSource,
+      });
+      localPlaySources = [];
     });
-    previous = snapshot(state);
+    previous = next;
   };
 
   window.addEventListener('resize', () => requestAnimationFrame(() => compressHumanHand(hand)));
@@ -132,7 +158,20 @@ function enhanceChoicePanel(state) {
   }
 }
 
-function animateStateChange({ before, state, game, ui, hand, drawPile, discard, opponents, motionToggle, localPlayRects }) {
+function animateStateChange({
+  before,
+  state,
+  game,
+  ui,
+  hand,
+  drawPile,
+  discard,
+  opponents,
+  motionToggle,
+  localPlaySources,
+  opponentSources,
+  drawSource,
+}) {
   if (!before?.started || !state.started || !motionEnabled(motionToggle)) return;
 
   const newSnapshot = snapshot(state);
@@ -144,11 +183,15 @@ function animateStateChange({ before, state, game, ui, hand, drawPile, discard, 
     const played = state.discardPile.slice(-discardDelta);
     played.forEach((card, index) => {
       const from = actorIndex === game.localSeat
-        ? localPlayRects[index] ?? humanSourceRect(hand)
-        : opponentSourceRect(opponents, state, game.localSeat, actorIndex);
+        ? localPlaySources[index] ?? humanSourceGeometry(hand)
+        : opponentSources.get(actorIndex) ?? opponentSourceGeometry(opponents, state, game.localSeat, actorIndex);
       const to = discardTargetRect(discard);
       if (from && to) window.setTimeout(() => flyFaceCard(ui, card, from, to), index * 95);
     });
+
+    const settleDelay = Math.max(0, (played.length - 1) * 95) + 420;
+    const finalCard = played.at(-1);
+    if (finalCard) window.setTimeout(() => ui.finishDiscardFlight?.(finalCard), settleDelay);
     baseDelay = discardDelta * 95;
   }
 
@@ -166,24 +209,42 @@ function animateStateChange({ before, state, game, ui, hand, drawPile, discard, 
     }
 
     addedIds.forEach((_, index) => {
-      const from = drawPile?.getBoundingClientRect();
+      const from = drawSource ?? elementGeometry(drawPile);
       const to = playerIndex === game.localSeat
-        ? humanTargetRect(hand)
-        : opponentTargetRect(opponents, state, game.localSeat, playerIndex);
+        ? humanTargetGeometry(hand)
+        : opponentTargetGeometry(opponents, state, game.localSeat, playerIndex);
       if (from && to) window.setTimeout(() => flyBackCard(from, to), baseDelay + index * 105);
     });
   });
 }
 
-function humanSourceRect(hand) {
-  const selected = hand?.querySelector('.hand-card.selected');
-  const any = selected ?? hand?.querySelector('.hand-card');
-  return any?.getBoundingClientRect() ?? hand?.getBoundingClientRect() ?? null;
+function elementGeometry(element) {
+  if (!element) return null;
+  const rect = element.getBoundingClientRect();
+  return { rect, rotation: elementRotation(element) };
 }
 
-function humanTargetRect(hand) {
+function elementRotation(element) {
+  if (!element) return 0;
+  const transform = getComputedStyle(element).transform;
+  if (!transform || transform === 'none') return 0;
+  try {
+    const matrix = new DOMMatrixReadOnly(transform);
+    return Math.atan2(matrix.b, matrix.a) * (180 / Math.PI);
+  } catch {
+    return 0;
+  }
+}
+
+function humanSourceGeometry(hand) {
+  const selected = hand?.querySelector('.hand-card.selected');
+  const any = selected ?? hand?.querySelector('.hand-card');
+  return elementGeometry(any ?? hand);
+}
+
+function humanTargetGeometry(hand) {
   const cards = [...(hand?.querySelectorAll('.hand-card') ?? [])];
-  return cards.at(-1)?.getBoundingClientRect() ?? hand?.getBoundingClientRect() ?? null;
+  return elementGeometry(cards.at(-1) ?? hand);
 }
 
 function opponentSeat(opponents, state, localSeat, playerIndex) {
@@ -192,17 +253,26 @@ function opponentSeat(opponents, state, localSeat, playerIndex) {
   return renderedIndex >= 0 ? opponents?.querySelectorAll('.opponent-seat')?.[renderedIndex] ?? null : null;
 }
 
-function opponentSourceRect(opponents, state, localSeat, playerIndex) {
+function opponentSourceGeometry(opponents, state, localSeat, playerIndex) {
   const seat = opponentSeat(opponents, state, localSeat, playerIndex);
   const visibleBacks = seat ? [...seat.querySelectorAll('.mini-back')] : [];
-  return visibleBacks.at(-1)?.getBoundingClientRect()
-    ?? seat?.querySelector('.opponent-hand')?.getBoundingClientRect()
-    ?? seat?.getBoundingClientRect()
-    ?? null;
+  return elementGeometry(visibleBacks.at(-1)
+    ?? seat?.querySelector('.opponent-hand')
+    ?? seat);
 }
 
-function opponentTargetRect(opponents, state, localSeat, playerIndex) {
-  return opponentSourceRect(opponents, state, localSeat, playerIndex);
+function opponentTargetGeometry(opponents, state, localSeat, playerIndex) {
+  return opponentSourceGeometry(opponents, state, localSeat, playerIndex);
+}
+
+function captureOpponentSources(opponents, state, localSeat) {
+  const sources = new Map();
+  (state.players ?? []).forEach((_, playerIndex) => {
+    if (playerIndex === localSeat) return;
+    const source = opponentSourceGeometry(opponents, state, localSeat, playerIndex);
+    if (source) sources.set(playerIndex, source);
+  });
+  return sources;
 }
 
 function discardTargetRect(discard) {
@@ -212,7 +282,7 @@ function discardTargetRect(discard) {
 function flyFaceCard(ui, card, from, to) {
   const element = ui.makeCard(card, { table: true });
   const compact = window.innerWidth <= 820;
-  prepareFlight(element, from, to, 7, {
+  prepareFlight(element, from, to, 0, {
     width: compact ? 78 : 106,
     height: compact ? 110 : 152,
   });
@@ -222,34 +292,40 @@ function flyBackCard(from, to) {
   const element = document.createElement('div');
   element.className = 'card card-back';
   element.innerHTML = '<div class="back-inner"><span>MAKAO</span></div>';
-  prepareFlight(element, from, to, -6);
+  prepareFlight(element, from, to, 0);
 }
 
-function prepareFlight(element, from, to, rotation, size = null) {
-  const width = size?.width ?? Math.max(46, Math.min(120, from.width || 106));
-  const height = size?.height ?? Math.max(64, Math.min(168, from.height || 152));
-  const sourceX = from.left + (from.width - width) / 2;
-  const sourceY = from.top + (from.height - height) / 2;
-  const targetX = to.left + (to.width - width) / 2;
-  const targetY = to.top + (to.height - height) / 2;
+function prepareFlight(element, from, to, endRotation = 0, size = null) {
+  const fromRect = from?.rect ?? from;
+  const toRect = to?.rect ?? to;
+  if (!fromRect || !toRect) return;
+
+  const width = size?.width ?? Math.max(46, Math.min(120, fromRect.width || 106));
+  const height = size?.height ?? Math.max(64, Math.min(168, fromRect.height || 152));
+  const sourceX = fromRect.left + (fromRect.width - width) / 2;
+  const sourceY = fromRect.top + (fromRect.height - height) / 2;
+  const targetX = toRect.left + (toRect.width - width) / 2;
+  const targetY = toRect.top + (toRect.height - height) / 2;
   const dx = targetX - sourceX;
   const dy = targetY - sourceY;
+  const startRotation = Number.isFinite(from?.rotation) ? from.rotation : 0;
 
   element.classList.add('ux-flight-card');
+  element.dataset.flightStartRotation = String(startRotation);
   element.style.left = `${sourceX}px`;
   element.style.top = `${sourceY}px`;
   element.style.width = `${width}px`;
   element.style.height = `${height}px`;
-  element.style.transform = 'translate(0,0) rotate(0deg) scale(1)';
+  element.style.transform = `translate(0,0) rotate(${startRotation}deg) scale(1)`;
   document.body.appendChild(element);
 
   requestAnimationFrame(() => {
     requestAnimationFrame(() => {
       element.classList.add('is-flying');
-      element.style.transform = `translate(${dx}px, ${dy}px) rotate(${rotation}deg) scale(.96)`;
+      element.style.transform = `translate(${dx}px, ${dy}px) rotate(${endRotation}deg) scale(.96)`;
       element.style.opacity = '.9';
     });
   });
 
-  window.setTimeout(() => element.remove(), 520);
+  window.setTimeout(() => element.remove(), 455);
 }
