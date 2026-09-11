@@ -186,3 +186,38 @@ test('played card stays single during flight and straightens at the discard pile
   await expect(flight).toHaveCount(0);
   await expect(page.locator('#discard-pile .table-card')).toHaveAttribute('data-card-id', playedId);
 });
+
+test('continue restores the last offline bot game after a reload', async ({ page }) => {
+  await page.goto('/');
+  await page.evaluate(() => {
+    window.makaoGame.start(2);
+    clearTimeout(window.makaoGame.timer);
+    window.makaoGame.timer = null;
+    window.makaoGame.state.currentIndex = 0;
+    window.makaoGame.state.turnNumber = 17;
+    window.makaoGame.onChange(window.makaoGame.state);
+  });
+
+  await page.reload();
+  const resume = page.locator('#resume-btn');
+  await expect(resume).toBeVisible();
+  await expect(resume.locator('strong')).toContainText('Kontynuuj');
+  await expect(resume.locator('strong')).toContainText('bot');
+  await resume.click();
+  await expect(page.locator('#main-menu')).not.toHaveClass(/open/);
+  await expect.poll(() => page.evaluate(() => window.makaoGame.state.turnNumber)).toBe(17);
+  await expect.poll(() => page.evaluate(() => window.makaoGame.state.players.length)).toBe(3);
+});
+
+test('continue menu identifies a stored online session without auto-entering it', async ({ page }) => {
+  await page.addInitScript(() => {
+    localStorage.setItem('makao.last-session.v1', JSON.stringify({ type: 'online', roomId: 'ABCD-EFGH', savedAt: Date.now() }));
+  });
+  await page.goto('/');
+
+  const resume = page.locator('#resume-btn');
+  await expect(resume).toBeVisible();
+  await expect(resume.locator('strong')).toContainText('Kontynuuj');
+  await expect(resume.locator('strong')).toContainText('online');
+  await expect(page.locator('#main-menu')).toHaveClass(/open/);
+});
