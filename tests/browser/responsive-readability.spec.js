@@ -142,8 +142,10 @@ async function auditReadability(page, label, { choiceOpen = false } = {}) {
     await expect(locator, `${label}: ${selector} cannot be reached by scrolling`).toBeVisible();
     const box = await locator.boundingBox();
     expect(box, `${label}: ${selector} has no layout box after scroll`).not.toBeNull();
-    expect(box.bottom, `${label}: ${selector} remains below viewport after scroll`).toBeLessThanOrEqual(report.viewport.height + 2);
-    expect(box.top, `${label}: ${selector} remains above viewport after scroll`).toBeGreaterThanOrEqual(-2);
+    const top = box.y;
+    const bottom = box.y + box.height;
+    expect(bottom, `${label}: ${selector} remains below viewport after scroll`).toBeLessThanOrEqual(report.viewport.height + 2);
+    expect(top, `${label}: ${selector} remains above viewport after scroll`).toBeGreaterThanOrEqual(-2);
   }
 
   expect(report.actionHandOverlap, `${label}: action bar overlaps the player's hand`).toBeLessThan(80);
