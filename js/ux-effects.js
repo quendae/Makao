@@ -181,17 +181,19 @@ function animateStateChange({
 
   if (discardDelta > 0) {
     const played = state.discardPile.slice(-discardDelta);
+    const finalIndex = played.length - 1;
     played.forEach((card, index) => {
       const from = actorIndex === game.localSeat
         ? localPlaySources[index] ?? humanSourceGeometry(hand)
         : opponentSources.get(actorIndex) ?? opponentSourceGeometry(opponents, state, game.localSeat, actorIndex);
       const to = discardTargetRect(discard);
-      if (from && to) window.setTimeout(() => flyFaceCard(ui, card, from, to), index * 95);
+      const onFinish = index === finalIndex ? () => ui.finishDiscardFlight?.(card) : null;
+      if (from && to) {
+        window.setTimeout(() => flyFaceCard(ui, card, from, to, onFinish), index * 95);
+      } else if (onFinish) {
+        onFinish();
+      }
     });
-
-    const settleDelay = Math.max(0, (played.length - 1) * 95) + 420;
-    const finalCard = played.at(-1);
-    if (finalCard) window.setTimeout(() => ui.finishDiscardFlight?.(finalCard), settleDelay);
     baseDelay = discardDelta * 95;
   }
 
@@ -279,13 +281,13 @@ function discardTargetRect(discard) {
   return discard?.querySelector('.table-card')?.getBoundingClientRect() ?? discard?.getBoundingClientRect() ?? null;
 }
 
-function flyFaceCard(ui, card, from, to) {
+function flyFaceCard(ui, card, from, to, onFinish = null) {
   const element = ui.makeCard(card, { table: true });
   const compact = window.innerWidth <= 820;
   prepareFlight(element, from, to, 0, {
     width: compact ? 78 : 106,
     height: compact ? 110 : 152,
-  });
+  }, onFinish);
 }
 
 function flyBackCard(from, to) {
@@ -295,10 +297,13 @@ function flyBackCard(from, to) {
   prepareFlight(element, from, to, 0);
 }
 
-function prepareFlight(element, from, to, endRotation = 0, size = null) {
+function prepareFlight(element, from, to, endRotation = 0, size = null, onFinish = null) {
   const fromRect = from?.rect ?? from;
   const toRect = to?.rect ?? to;
-  if (!fromRect || !toRect) return;
+  if (!fromRect || !toRect) {
+    onFinish?.();
+    return;
+  }
 
   const width = size?.width ?? Math.max(46, Math.min(120, fromRect.width || 106));
   const height = size?.height ?? Math.max(64, Math.min(168, fromRect.height || 152));
@@ -327,5 +332,8 @@ function prepareFlight(element, from, to, endRotation = 0, size = null) {
     });
   });
 
-  window.setTimeout(() => element.remove(), 455);
+  window.setTimeout(() => {
+    element.remove();
+    onFinish?.();
+  }, 455);
 }
