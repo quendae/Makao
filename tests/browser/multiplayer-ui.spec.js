@@ -115,16 +115,23 @@ test('rendering an unchanged state preserves discard and hand card DOM nodes', a
   expect(stable.sameHand).toBe(true);
 });
 
-test('full-size cards keep one geometry from hand through flight to discard', async ({ page }) => {
-  await page.goto('/');
+async function startDeterministicHumanTurn(page) {
   await page.evaluate(() => {
     window.makaoGame.start(2);
     clearTimeout(window.makaoGame.timer);
     window.makaoGame.timer = null;
     window.makaoGame.state.currentIndex = 0;
+    const firstCard = window.makaoGame.state.players[0]?.hand?.[0];
+    const topCard = window.makaoGame.state.discardPile?.at(-1);
+    if (firstCard && topCard) topCard.suit = firstCard.suit;
     window.makaoGame.onChange(window.makaoGame.state);
     document.getElementById('main-menu')?.classList.remove('open');
   });
+}
+
+test('full-size cards keep one geometry from hand through flight to discard', async ({ page }) => {
+  await page.goto('/');
+  await startDeterministicHumanTurn(page);
 
   const size = async (selector) => page.locator(selector).first().evaluate((element) => {
     const style = getComputedStyle(element);
@@ -156,14 +163,7 @@ test('full-size cards keep one geometry from hand through flight to discard', as
 
 test('played card stays single during flight and straightens at the discard pile', async ({ page }) => {
   await page.goto('/');
-  await page.evaluate(() => {
-    window.makaoGame.start(2);
-    clearTimeout(window.makaoGame.timer);
-    window.makaoGame.timer = null;
-    window.makaoGame.state.currentIndex = 0;
-    window.makaoGame.onChange(window.makaoGame.state);
-    document.getElementById('main-menu')?.classList.remove('open');
-  });
+  await startDeterministicHumanTurn(page);
 
   const oldDiscardId = await page.locator('#discard-pile .table-card').getAttribute('data-card-id');
   const playable = page.locator('#human-hand .hand-card.playable').first();
