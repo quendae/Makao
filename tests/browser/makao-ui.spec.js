@@ -227,8 +227,14 @@ test('browser agent plays complete games through real DOM handlers without layou
       while (!game.state.gameOver && ticks < MAX_TICKS) {
         maxHand = Math.max(maxHand, ...game.state.players.map((player) => player.hand.length));
         const player = game.state.players[game.state.currentIndex];
+        const choiceActor = Number.isInteger(game.state.pendingChoice?.actorIndex)
+          ? game.state.players[game.state.pendingChoice.actorIndex]
+          : null;
 
-        if (player?.isHuman && game.state.pendingChoice) {
+        // A Jack/Ace choice belongs to the player who played the functional
+        // card. currentIndex may already point at the next player while the
+        // modal is still waiting for that human choice.
+        if (game.state.pendingChoice && choiceActor?.isHuman) {
           const choice = game.state.pendingChoice.type === 'jack'
             ? document.querySelector('#choice-options .choice-none') ?? document.querySelector('#choice-options .choice-button')
             : document.querySelector('#choice-options .choice-button');
