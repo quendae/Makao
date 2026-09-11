@@ -10,6 +10,6 @@
     "rules:audit": "node scripts/rules-audit.mjs",
     "stress": "node scripts/stress.mjs",
     "audit": "npm run rules:audit && npm run stress -- 1000",
-    "check": "node --check js/constants.js && node --check js/rules.js && node --check js/bot.js && node --check js/game.js && node --check js/multiplayer.js && node --check js/ui.js && node --check js/ux-effects.js && node --check js/main.js && node --check scripts/build-single.mjs && node --check scripts/stress.mjs && node --check scripts/rules-audit.mjs && node --check cloudflare-signaling/src/worker.js"
+    "check": "node --check js/constants.js && node --check js/rules.js && node --check js/bot.js && node --check js/game.js && node --check js/multiplayer.js && node --check js/ui.js && node --check js/cardroom-ui.js && node --check js/ux-effects.js && node --check js/main.js && node --check scripts/build-single.mjs && node --check scripts/stress.mjs && node --check scripts/rules-audit.mjs && node --check cloudflare-signaling/src/worker.js"
   }
 }
