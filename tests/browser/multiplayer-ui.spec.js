@@ -115,6 +115,45 @@ test('rendering an unchanged state preserves discard and hand card DOM nodes', a
   expect(stable.sameHand).toBe(true);
 });
 
+test('full-size cards keep one geometry from hand through flight to discard', async ({ page }) => {
+  await page.goto('/');
+  await page.evaluate(() => {
+    window.makaoGame.start(2);
+    clearTimeout(window.makaoGame.timer);
+    window.makaoGame.timer = null;
+    window.makaoGame.state.currentIndex = 0;
+    window.makaoGame.onChange(window.makaoGame.state);
+    document.getElementById('main-menu')?.classList.remove('open');
+  });
+
+  const size = async (selector) => page.locator(selector).first().evaluate((element) => {
+    const style = getComputedStyle(element);
+    return { width: parseFloat(style.width), height: parseFloat(style.height) };
+  });
+
+  const handSize = await size('#human-hand .hand-card');
+  const discardSize = await size('#discard-pile .table-card');
+  const drawSize = await size('#draw-pile .card-back');
+  expect(discardSize).toEqual(handSize);
+  expect(drawSize).toEqual(handSize);
+
+  const playable = page.locator('#human-hand .hand-card.playable').first();
+  await expect(playable).toBeVisible();
+  await playable.click();
+  await page.locator('#play-btn').click();
+  await page.evaluate(() => {
+    clearTimeout(window.makaoGame.timer);
+    window.makaoGame.timer = null;
+  });
+
+  const flight = page.locator('.ux-flight-card.is-flying').first();
+  await expect(flight).toBeVisible();
+  const flightSize = await size('.ux-flight-card.is-flying');
+  expect(flightSize).toEqual(handSize);
+  const transform = await flight.evaluate((element) => element.style.transform);
+  expect(transform).toContain('scale(1)');
+});
+
 test('played card stays single during flight and straightens at the discard pile', async ({ page }) => {
   await page.goto('/');
   await page.evaluate(() => {
