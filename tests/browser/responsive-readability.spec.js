@@ -72,12 +72,12 @@ async function auditReadability(page, label, { choiceOpen = false } = {}) {
     };
 
     const criticalSelectors = [
-      '#felt-table', '#human-hand', '#action-bar', '#human-player-plate',
+      '#felt-table', '#human-hand', '#action-bar', '#human-seat',
       '#draw-btn', '#play-btn', '#makao-btn', '.phase-ribbon',
     ];
     const critical = Object.fromEntries(criticalSelectors.map((selector) => [selector, rectOf(selector)]));
 
-    const textSelectors = ['#draw-btn', '#play-btn', '#makao-btn', '.phase-ribbon', '.human-plate .plate-copy strong'];
+    const textSelectors = ['#draw-btn', '#play-btn', '#makao-btn', '.phase-ribbon', '#human-seat .plate-copy strong'];
     const text = textSelectors.map((selector) => {
       const element = document.querySelector(selector);
       if (!visible(element)) return { selector, visible: false };
@@ -123,14 +123,27 @@ async function auditReadability(page, label, { choiceOpen = false } = {}) {
     };
   }, { choiceOpen });
 
+  // Mobile/tablet gameplay is intentionally a vertically scrollable table below
+  // the header. It must never escape horizontally, and every critical control
+  // must be reachable by normal page scrolling.
   expect(report.body.scrollWidth, `${label}: body has horizontal overflow`).toBeLessThanOrEqual(report.viewport.width + 2);
 
   for (const [selector, rect] of Object.entries(report.critical)) {
     expect(rect, `${label}: critical element ${selector} is not visible`).not.toBeNull();
     expect(
-      rect.left >= -2 && rect.top >= -2 && rect.right <= report.viewport.width + 2 && rect.bottom <= report.viewport.height + 2,
-      `${label}: ${selector} is clipped (${JSON.stringify(rect)}) in ${report.viewport.width}x${report.viewport.height}`,
+      rect.left >= -2 && rect.right <= report.viewport.width + 2,
+      `${label}: ${selector} escapes horizontally (${JSON.stringify(rect)}) in ${report.viewport.width}x${report.viewport.height}`,
     ).toBe(true);
+  }
+
+  for (const selector of ['#human-hand', '#action-bar', '#human-seat', '#draw-btn', '#play-btn', '#makao-btn']) {
+    const locator = page.locator(selector).first();
+    await locator.scrollIntoViewIfNeeded();
+    await expect(locator, `${label}: ${selector} cannot be reached by scrolling`).toBeVisible();
+    const box = await locator.boundingBox();
+    expect(box, `${label}: ${selector} has no layout box after scroll`).not.toBeNull();
+    expect(box.bottom, `${label}: ${selector} remains below viewport after scroll`).toBeLessThanOrEqual(report.viewport.height + 2);
+    expect(box.top, `${label}: ${selector} remains above viewport after scroll`).toBeGreaterThanOrEqual(-2);
   }
 
   expect(report.actionHandOverlap, `${label}: action bar overlaps the player's hand`).toBeLessThan(80);
@@ -146,6 +159,8 @@ async function auditReadability(page, label, { choiceOpen = false } = {}) {
   }
 
   if (choiceOpen) {
+    // Choice panels are fixed overlays and therefore should stay wholly in the
+    // viewport even when the underlying table itself scrolls vertically.
     expect(report.choice, `${label}: choice panel is missing`).not.toBeNull();
     expect(
       report.choice.left >= -2 && report.choice.top >= -2 && report.choice.right <= report.viewport.width + 2 && report.choice.bottom <= report.viewport.height + 2,
