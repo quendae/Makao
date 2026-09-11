@@ -1596,10 +1596,10 @@ class MakaoGame {
 }
 
 // ===== js/multiplayer.js =====
-const RTC_CONFIG = { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] };
-const SIGNAL_TIMEOUT_MS = 12000;
-const MAX_MESSAGE_BYTES = 96 * 1024;
-const ROOM_ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+const GAME_ID = 'makao';
+const WS_URL = 'wss://api.qqnd.fyi/api/v1/ws';
+const SESSION_STORAGE_KEY = 'makao.qqnd.server-session.v1';
+const REQUEST_TIMEOUT_MS = 12000;
 const GAME_ACTIONS = new Set(['play-cards', 'draw', 'pass-after-draw', 'toggle-makao', 'choose-pending']);
 
 function normalizeRoomCode(value) {
@@ -1607,36 +1607,7 @@ function normalizeRoomCode(value) {
   return raw.length === 8 ? `${raw.slice(0, 4)}-${raw.slice(4)}` : '';
 }
 
-function filterStateForSeat(state, seat) {
-  const view = typeof structuredClone === 'function'
-    ? structuredClone(state)
-    : JSON.parse(JSON.stringify(state));
-
-  view.players = (view.players || []).map((player, index) => ({
-    ...player,
-    isLocal: index === seat,
-    hand: index === seat
-      ? player.hand
-      : Array.from({ length: player.hand?.length || 0 }, () => ({ hidden: true })),
-  }));
-  view.drawPile = Array.from({ length: view.drawPile?.length || 0 }, () => ({ hidden: true }));
-
-  if (view.pendingChoice?.actorIndex !== seat) view.pendingChoice = null;
-  if (view.currentIndex !== seat) {
-    view.drawnRescueCardId = null;
-    view.makaoArmed = false;
-  }
-
-  return view;
-}
-
-function seatReady({ seat, tableSize, botSeats, peers }) {
-  if (!Number.isInteger(seat) || seat <= 0 || seat >= tableSize) return false;
-  if (botSeats.has(seat)) return true;
-  return Boolean(peers.get(seat)?.connected);
-}
-
-function validateNick(value) {
+function validateNickname(value) {
   const nickname = String(value || '')
     .normalize('NFKC')
     .replace(/[\u200B-\u200D\u2060\uFEFF]/g, '')
@@ -1650,71 +1621,17 @@ function validateNick(value) {
   return { ok: true, nickname };
 }
 
+function lobbyReady({ humanCount, botCount, tableSize }) {
+  return Number.isInteger(tableSize) && [3, 4].includes(tableSize) && humanCount >= 1 && humanCount + botCount === tableSize;
+}
+
 function safeJsonParse(raw) {
-  try {
-    const text = typeof raw === 'string' ? raw : String(raw || '');
-    if (text.length > MAX_MESSAGE_BYTES) return null;
-    return JSON.parse(text);
-  } catch {
-    return null;
-  }
+  try { return JSON.parse(typeof raw === 'string' ? raw : String(raw || '')); }
+  catch { return null; }
 }
 
-function safeClose(target) {
-  try {
-    target?.close?.();
-  } catch {
-    // Already closed.
-  }
-}
-
-function channelOpen(channel) {
-  return channel?.readyState === 'open';
-}
-
-function randomRoomCode() {
-  const bytes = new Uint8Array(8);
-  globalThis.crypto.getRandomValues(bytes);
-  const chars = Array.from(bytes, (byte) => ROOM_ALPHABET[byte % ROOM_ALPHABET.length]).join('');
-  return `${chars.slice(0, 4)}-${chars.slice(4)}`;
-}
-
-async function sha256Hex(value) {
-  const bytes = new TextEncoder().encode(value);
-  const hash = await globalThis.crypto.subtle.digest('SHA-256', bytes);
-  return Array.from(new Uint8Array(hash), (byte) => byte.toString(16).padStart(2, '0')).join('');
-}
-
-async function roomVerifier(room, password = '') {
-  return sha256Hex(`makao-p2p:${room}:${password}`);
-}
-
-function waitForIce(pc, timeoutMs = 6000) {
-  if (pc.iceGatheringState === 'complete') return Promise.resolve();
-  return new Promise((resolve) => {
-    let done = false;
-    const finish = () => {
-      if (done) return;
-      done = true;
-      clearTimeout(timer);
-      pc.removeEventListener('icegatheringstatechange', onChange);
-      resolve();
-    };
-    const onChange = () => {
-      if (pc.iceGatheringState === 'complete') finish();
-    };
-    const timer = setTimeout(finish, timeoutMs);
-    pc.addEventListener('icegatheringstatechange', onChange);
-  });
-}
-
-function signalingErrorMessage(error) {
-  const message = String(error?.message || error || 'Błąd połączenia');
-  if (/404|expired|not found/i.test(message)) return 'Pokój nie istnieje albo wygasł.';
-  if (/403|auth|password|token/i.test(message)) return 'Nieprawidłowy kod pokoju lub hasło.';
-  if (/full|4009/i.test(message)) return 'Pokój jest pełny.';
-  if (/timeout|timed out/i.test(message)) return 'Przekroczono czas łączenia z usługą sygnalizacji.';
-  return message;
+function escapeHtml(value) {
+  return String(value || '').replace(/[&<>'"]/g, (char) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', "'": '&#39;', '"': '&quot;' })[char]);
 }
 
 class MakaoMultiplayer {
@@ -1722,7 +1639,18 @@ class MakaoMultiplayer {
     this.game = game;
     this.ui = null;
     this.pendingTableSize = 3;
+    this.lobbyBotCount = 0;
+    this.socket = null;
+    this.socketPromise = null;
+    this.waiters = [];
+    this.reconnectTimer = null;
+    this.reconnectAttempt = 0;
     this.intentionalClose = false;
+    this.authSession = null;
+    this.resumeToken = '';
+    this.rooms = [];
+    this.presence = new Map();
+    this.graceTicker = null;
     this.session = this.emptySession();
     this.el = {};
   }
@@ -1730,83 +1658,92 @@ class MakaoMultiplayer {
   emptySession() {
     return {
       active: false,
-      role: null,
       room: '',
-      nick: '',
-      auth: '',
-      hostToken: '',
-      passwordProtected: false,
-      localSeat: 0,
+      roomObj: null,
+      role: null,
+      localSeat: -1,
       tableSize: this.pendingTableSize || 3,
       names: ['', '', '', ''],
       botSeats: new Set(),
-      peers: new Map(),
-      signalToSeat: new Map(),
-      guestPc: null,
-      guestChannel: null,
-      signaling: null,
       inGame: false,
-      revision: 0,
+      authoritative: false,
       lastRevision: 0,
-      connectedSeats: new Set(),
     };
   }
 
   attachUI(ui) {
     this.ui = ui;
     this.bindElements();
+    this.upgradeMarkup();
     this.bindEvents();
     this.restoreName();
     this.renderEntry();
     this.updateNetworkPill();
+    this.resumeStoredSession(true).catch(() => {});
   }
 
   bindElements() {
     const $ = (id) => document.getElementById(id);
     this.el = {
-      open: $('multiplayer-btn'),
-      modal: $('multiplayer-modal'),
-      close: $('mp-close'),
-      entry: $('mp-entry'),
-      hostPanel: $('mp-host-panel'),
-      guestPanel: $('mp-guest-panel'),
-      lobbyPanel: $('mp-lobby-panel'),
-      chooseHost: $('mp-choose-host'),
-      chooseGuest: $('mp-choose-guest'),
-      hostBack: $('mp-host-back'),
-      guestBack: $('mp-guest-back'),
-      hostNick: $('mp-host-nick'),
-      hostPassword: $('mp-host-password'),
-      guestNick: $('mp-guest-nick'),
-      guestPassword: $('mp-guest-password'),
-      roomInput: $('mp-room-code'),
-      create: $('mp-create-room'),
-      join: $('mp-join-room'),
-      hostStatus: $('mp-host-status'),
-      guestStatus: $('mp-guest-status'),
-      lobbyStatus: $('mp-lobby-status'),
-      roomCode: $('mp-room-code-display'),
-      copyRoom: $('mp-copy-room'),
-      seats: $('mp-seats'),
-      start: $('mp-start-game'),
-      leave: $('mp-leave-room'),
-      tableSize: $('mp-table-size'),
-      pill: $('network-pill'),
-      disconnect: $('mp-disconnect'),
-      disconnectText: $('mp-disconnect-text'),
-      disconnectLeave: $('mp-disconnect-leave'),
+      open: $('multiplayer-btn'), modal: $('multiplayer-modal'), close: $('mp-close'), entry: $('mp-entry'),
+      hostPanel: $('mp-host-panel'), guestPanel: $('mp-guest-panel'), lobbyPanel: $('mp-lobby-panel'),
+      chooseHost: $('mp-choose-host'), chooseGuest: $('mp-choose-guest'), hostBack: $('mp-host-back'), guestBack: $('mp-guest-back'),
+      hostNick: $('mp-host-nick'), guestNick: $('mp-guest-nick'), roomInput: $('mp-room-code'), create: $('mp-create-room'), join: $('mp-join-room'),
+      hostStatus: $('mp-host-status'), guestStatus: $('mp-guest-status'), lobbyStatus: $('mp-lobby-status'), roomCode: $('mp-room-code-display'),
+      copyRoom: $('mp-copy-room'), seats: $('mp-seats'), start: $('mp-start-game'), leave: $('mp-leave-room'), tableSize: $('mp-table-size'),
+      pill: $('network-pill'), disconnect: $('mp-disconnect'), disconnectText: $('mp-disconnect-text'), disconnectLeave: $('mp-disconnect-leave'),
     };
+  }
+
+  upgradeMarkup() {
+    document.title = 'Makao — Offline / Online';
+    const topEyebrow = document.querySelector('.brand-block .eyebrow');
+    if (topEyebrow) topEyebrow.textContent = 'PRYWATNY STÓŁ · OFFLINE / ONLINE';
+    const lead = document.querySelector('#main-menu .menu-lead');
+    if (lead) lead.textContent = 'Graj offline z botami albo przy wspólnym stole online z reconnectem i botami zastępczymi.';
+    const multiplayerStrong = this.el.open?.querySelector('strong');
+    if (multiplayerStrong) multiplayerStrong.textContent = 'Multiplayer online';
+    const mpTitle = document.getElementById('mp-title');
+    if (mpTitle) mpTitle.textContent = 'QQND Card Room';
+    const mpLead = this.el.entry?.querySelector('.mp-lead');
+    if (mpLead) mpLead.textContent = 'Utwórz publiczny lub prywatny pokój, dołącz kodem albo wybierz stół z listy. Serwer pilnuje kart, zasad i botów.';
+    const footnote = this.el.entry?.querySelector('.mp-footnote');
+    if (footnote) footnote.textContent = 'Po rozłączeniu miejsce jest rezerwowane przez 60 s, potem ten sam seat i rękę przejmuje bot. Powrót odzyskuje aktualny stan bez cofania gry.';
+
+    const hostPassword = document.getElementById('mp-host-password')?.closest('.mp-field');
+    const guestPassword = document.getElementById('mp-guest-password')?.closest('.mp-field');
+    hostPassword?.classList.add('hidden');
+    guestPassword?.classList.add('hidden');
+
+    if (!document.getElementById('mp-visibility')) {
+      const field = document.createElement('label');
+      field.className = 'mp-field';
+      field.innerHTML = '<span>Widoczność pokoju</span><select id="mp-visibility"><option value="public">Publiczny — widoczny na liście</option><option value="private">Prywatny — tylko kod pokoju</option></select>';
+      this.el.tableSize?.closest('.mp-field')?.before(field);
+    }
+    this.el.visibility = document.getElementById('mp-visibility');
+
+    if (!document.getElementById('mp-room-browser')) {
+      const browser = document.createElement('section');
+      browser.id = 'mp-room-browser';
+      browser.className = 'mp-browser';
+      browser.innerHTML = '<div class="mp-browser-head"><div><span class="eyebrow">PUBLICZNE STOŁY</span><strong>Dostępne pokoje</strong></div><button id="mp-refresh-rooms" class="btn ghost compact" type="button">Odśwież</button></div><div id="mp-room-list" class="mp-room-list"><p class="mp-empty">Łączenie z serwerem…</p></div>';
+      this.el.entry?.appendChild(browser);
+    }
+    this.el.refreshRooms = document.getElementById('mp-refresh-rooms');
+    this.el.roomList = document.getElementById('mp-room-list');
+
+    const lobbyFootnote = this.el.lobbyPanel?.querySelector('.mp-footnote');
+    if (lobbyFootnote) lobbyFootnote.textContent = 'Wolne miejsca możesz zapełnić botami. Po starcie serwer jest jedynym źródłem stanu gry.';
+    const disconnectTitle = this.el.disconnect?.querySelector('h2');
+    if (disconnectTitle) disconnectTitle.textContent = 'Status gracza';
+    if (this.el.disconnectLeave) this.el.disconnectLeave.textContent = 'Opuść stół';
   }
 
   bindEvents() {
     this.el.open?.addEventListener('click', () => this.openModal());
-    this.el.close?.addEventListener('click', () => {
-      if (this.session.active) this.leaveRoom();
-      else this.closeModal();
-    });
-    this.el.modal?.addEventListener('click', (event) => {
-      if (event.target === this.el.modal && !this.session.active) this.closeModal();
-    });
+    this.el.close?.addEventListener('click', () => this.closeModal());
+    this.el.modal?.addEventListener('click', (event) => { if (event.target === this.el.modal) this.closeModal(); });
     this.el.chooseHost?.addEventListener('click', () => this.showPanel('host'));
     this.el.chooseGuest?.addEventListener('click', () => this.showPanel('guest'));
     this.el.hostBack?.addEventListener('click', () => this.renderEntry());
@@ -1814,64 +1751,78 @@ class MakaoMultiplayer {
     this.el.create?.addEventListener('click', () => this.createRoom());
     this.el.join?.addEventListener('click', () => this.joinRoom());
     this.el.copyRoom?.addEventListener('click', () => this.copyRoomCode());
-    this.el.start?.addEventListener('click', () => this.startHostGame());
+    this.el.start?.addEventListener('click', () => this.startGame());
     this.el.leave?.addEventListener('click', () => this.leaveRoom());
     this.el.disconnectLeave?.addEventListener('click', () => this.leaveRoom());
+    this.el.refreshRooms?.addEventListener('click', () => this.refreshRooms());
+    this.el.roomList?.addEventListener('click', (event) => {
+      const button = event.target.closest('[data-room-id]');
+      if (button) this.joinPublicRoom(button.dataset.roomId);
+    });
+    this.el.hostNick?.addEventListener('input', () => this.syncNickInputs(this.el.hostNick, this.el.guestNick));
+    this.el.guestNick?.addEventListener('input', () => this.syncNickInputs(this.el.guestNick, this.el.hostNick));
     this.el.tableSize?.addEventListener('click', (event) => {
       const button = event.target.closest('[data-mp-table-size]');
-      if (!button || this.session.active) return;
+      if (!button || this.session.inGame) return;
       this.pendingTableSize = Number(button.dataset.mpTableSize) === 4 ? 4 : 3;
+      this.session.tableSize = this.pendingTableSize;
       this.el.tableSize.querySelectorAll('[data-mp-table-size]').forEach((item) => item.classList.toggle('active', item === button));
+      this.reconcileLobbyBots();
+      this.broadcastLobbyMeta();
+      this.renderLobby();
     });
     this.el.seats?.addEventListener('click', (event) => {
       const button = event.target.closest('[data-mp-bot-seat]');
-      if (!button) return;
-      this.toggleBotSeat(Number(button.dataset.mpBotSeat));
+      if (!button || this.session.role !== 'host' || this.session.inGame) return;
+      const seat = Number(button.dataset.mpBotSeat);
+      const humanCount = this.session.roomObj?.players?.length || 0;
+      const botStart = humanCount;
+      const isBot = seat >= botStart && seat < botStart + this.lobbyBotCount;
+      this.lobbyBotCount = Math.max(0, Math.min(this.session.tableSize - humanCount, this.lobbyBotCount + (isBot ? -1 : 1)));
+      this.broadcastLobbyMeta();
+      this.renderLobby();
     });
   }
 
+  syncNickInputs(source, target) { if (source && target && document.activeElement !== target) target.value = source.value; }
+
   restoreName() {
-    let name = '';
-    try {
-      name = localStorage.getItem('makao-player-name') || '';
-    } catch {
-      // Storage may be disabled.
-    }
+    const stored = this.loadStoredSession();
+    let name = stored?.nickname || '';
+    try { name ||= localStorage.getItem('makao-player-name') || ''; } catch {}
     if (name) {
       if (this.el.hostNick) this.el.hostNick.value = name;
       if (this.el.guestNick) this.el.guestNick.value = name;
     }
   }
 
-  persistName(name) {
+  persistName(name) { try { localStorage.setItem('makao-player-name', name); } catch {} }
+
+  loadStoredSession() {
     try {
-      localStorage.setItem('makao-player-name', name);
-    } catch {
-      // Storage may be disabled.
-    }
+      const parsed = JSON.parse(localStorage.getItem(SESSION_STORAGE_KEY) || 'null');
+      if (parsed?.sessionId && parsed?.resumeToken) return parsed;
+    } catch {}
+    return null;
   }
+
+  storeSession() {
+    if (!this.authSession?.id || !this.resumeToken) return;
+    try { localStorage.setItem(SESSION_STORAGE_KEY, JSON.stringify({ sessionId: this.authSession.id, resumeToken: this.resumeToken, nickname: this.authSession.nickname })); } catch {}
+  }
+
+  clearStoredSession() { try { localStorage.removeItem(SESSION_STORAGE_KEY); } catch {} }
 
   openModal() {
     this.ui?.closeMenu?.();
     this.el.modal?.classList.add('open');
-    if (this.session.active) this.renderLobby();
-    else this.renderEntry();
+    if (this.session.active) this.renderLobby(); else this.renderEntry();
+    this.refreshRooms().catch(() => {});
   }
 
-  closeModal() {
-    this.el.modal?.classList.remove('open');
-  }
-
-  renderEntry() {
-    this.setView('entry');
-    this.setStatus('host', '');
-    this.setStatus('guest', '');
-  }
-
-  showPanel(name) {
-    this.setView(name);
-  }
-
+  closeModal() { this.el.modal?.classList.remove('open'); }
+  renderEntry() { this.setView('entry'); this.setStatus('host', ''); this.setStatus('guest', ''); }
+  showPanel(name) { this.setView(name); }
   setView(name) {
     this.el.entry?.classList.toggle('hidden', name !== 'entry');
     this.el.hostPanel?.classList.toggle('hidden', name !== 'host');
@@ -1886,499 +1837,321 @@ class MakaoMultiplayer {
     element.classList.toggle('error', Boolean(isError));
   }
 
-  signalingBase() {
-    const configured = document.querySelector('meta[name="makao-signaling-url"]')?.getAttribute('content')?.trim();
-    if (configured) return configured.replace(/\/$/, '');
-    if (location.protocol === 'https:' || location.hostname === 'localhost' || location.hostname === '127.0.0.1') {
-      return location.origin;
-    }
-    return '';
-  }
-
-  websocketUrl(base, room) {
-    const url = new URL(`${base}/api/rooms/${encodeURIComponent(room)}/socket`);
-    url.protocol = url.protocol === 'https:' ? 'wss:' : 'ws:';
-    return url.toString();
-  }
-
-  async createRoom() {
-    if (!window.RTCPeerConnection || !globalThis.crypto?.subtle) {
-      this.setStatus('host', 'Ta przeglądarka nie obsługuje WebRTC/Web Crypto.', true);
-      return;
-    }
-    const checked = validateNick(this.el.hostNick?.value);
-    if (!checked.ok) return this.setStatus('host', checked.message, true);
-    const password = this.el.hostPassword?.value || '';
-    if (password && password.length < 6) return this.setStatus('host', 'Hasło powinno mieć co najmniej 6 znaków.', true);
-    const base = this.signalingBase();
-    if (!base) return this.setStatus('host', 'Multiplayer wymaga wdrożonego adresu HTTPS z usługą /api/.', true);
-
-    this.closeNetworkResources();
-    this.session = this.emptySession();
-    this.session.active = true;
-    this.session.role = 'host';
-    this.session.tableSize = this.pendingTableSize;
-    this.session.localSeat = 0;
-    this.session.nick = checked.nickname;
-    this.session.names[0] = checked.nickname;
-    this.session.passwordProtected = Boolean(password);
-    this.persistName(checked.nickname);
-    this.setStatus('host', 'Tworzenie pokoju…');
-
-    try {
-      let created = null;
-      for (let attempt = 0; attempt < 4 && !created; attempt += 1) {
-        const room = randomRoomCode();
-        const auth = await roomVerifier(room, password);
-        const response = await this.fetchWithTimeout(`${base}/api/rooms`, {
-          method: 'POST',
-          headers: { 'content-type': 'application/json' },
-          body: JSON.stringify({ room, nick: checked.nickname, auth, passwordProtected: Boolean(password) }),
-        });
-        if (response.status === 409) continue;
-        if (!response.ok) throw new Error(`Room create failed: ${response.status}`);
-        created = await response.json();
-        this.session.room = created.room;
-        this.session.auth = auth;
-        this.session.hostToken = created.hostToken;
-      }
-      if (!created) throw new Error('Nie udało się wygenerować wolnego kodu pokoju.');
-      await this.openSignaling('host', { token: this.session.hostToken });
-      this.renderLobby();
-      this.setStatus('lobby', 'Pokój gotowy. Przekaż kod pozostałym graczom.');
-    } catch (error) {
-      this.setStatus('host', signalingErrorMessage(error), true);
-      this.closeNetworkResources();
-      this.session = this.emptySession();
-    }
-  }
-
-  async joinRoom() {
-    if (!window.RTCPeerConnection || !globalThis.crypto?.subtle) {
-      this.setStatus('guest', 'Ta przeglądarka nie obsługuje WebRTC/Web Crypto.', true);
-      return;
-    }
-    const checked = validateNick(this.el.guestNick?.value);
-    if (!checked.ok) return this.setStatus('guest', checked.message, true);
-    const room = normalizeRoomCode(this.el.roomInput?.value);
-    if (!room) return this.setStatus('guest', 'Wpisz pełny ośmioznakowy kod pokoju.', true);
-    const password = this.el.guestPassword?.value || '';
-    const base = this.signalingBase();
-    if (!base) return this.setStatus('guest', 'Multiplayer wymaga wdrożonego adresu HTTPS z usługą /api/.', true);
-
-    this.closeNetworkResources();
-    this.session = this.emptySession();
-    this.session.active = true;
-    this.session.role = 'guest';
-    this.session.localSeat = -1;
-    this.session.room = room;
-    this.session.nick = checked.nickname;
-    this.session.auth = await roomVerifier(room, password);
-    this.session.passwordProtected = Boolean(password);
-    this.persistName(checked.nickname);
-    this.setStatus('guest', 'Łączenie z pokojem…');
-
-    try {
-      await this.openSignaling('guest', { auth: this.session.auth, nick: checked.nickname });
-      const pc = new RTCPeerConnection(RTC_CONFIG);
-      this.session.guestPc = pc;
-      const channel = pc.createDataChannel('makao', { ordered: true });
-      this.attachGuestChannel(channel);
-      pc.onconnectionstatechange = () => {
-        if (['failed', 'disconnected', 'closed'].includes(pc.connectionState)) this.networkInterrupted(0);
-      };
-      const offer = await pc.createOffer();
-      await pc.setLocalDescription(offer);
-      await waitForIce(pc);
-      this.signalSend({ type: 'offer', sdp: pc.localDescription });
-      this.setView('lobby');
-      this.renderLobby();
-      this.setStatus('lobby', 'Pokój znaleziony. Łączenie bezpośrednie z gospodarzem…');
-    } catch (error) {
-      this.setStatus('guest', signalingErrorMessage(error), true);
-      this.closeNetworkResources();
-      this.session = this.emptySession();
-    }
-  }
-
-  async fetchWithTimeout(url, options) {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), SIGNAL_TIMEOUT_MS);
-    try {
-      return await fetch(url, { ...options, signal: controller.signal, cache: 'no-store' });
-    } catch (error) {
-      if (error?.name === 'AbortError') throw new Error('Signaling timeout');
-      throw error;
-    } finally {
-      clearTimeout(timer);
-    }
-  }
-
-  openSignaling(role, credentials) {
-    const base = this.signalingBase();
-    if (!base) return Promise.reject(new Error('Brak adresu sygnalizacji'));
-    const ws = new WebSocket(this.websocketUrl(base, this.session.room));
-    this.session.signaling = ws;
-
+  addWaiter(types) {
+    const expected = new Set(Array.isArray(types) ? types : [types]);
     return new Promise((resolve, reject) => {
-      let authenticated = false;
-      const timer = setTimeout(() => {
-        if (!authenticated) {
-          safeClose(ws);
-          reject(new Error('Signaling timeout'));
-        }
-      }, SIGNAL_TIMEOUT_MS);
-
-      ws.onmessage = (event) => {
-        const message = safeJsonParse(event.data);
-        if (!message) return;
-        if (message.type === 'auth-required') {
-          ws.send(JSON.stringify({ type: 'authenticate', role, ...credentials }));
-          return;
-        }
-        if (message.type === 'authenticated') {
-          authenticated = true;
-          clearTimeout(timer);
-          resolve(message);
-          if (role === 'host') {
-            for (const guest of message.guests || []) {
-              if (guest.offer) queueMicrotask(() => this.handleHostOffer({ type: 'offer', guestId: guest.id, nick: guest.nick, sdp: guest.offer }));
-            }
-          }
-          return;
-        }
-        this.handleSignalMessage(message);
-      };
-
-      ws.onerror = () => {
-        if (!authenticated) {
-          clearTimeout(timer);
-          reject(new Error('Nie udało się połączyć z sygnalizacją.'));
-        }
-      };
-
-      ws.onclose = (event) => {
-        clearTimeout(timer);
-        if (!authenticated) {
-          reject(new Error(event.reason || `Signaling closed (${event.code})`));
-          return;
-        }
-        if (!this.intentionalClose && !this.session.inGame && this.session.active) {
-          this.setStatus('lobby', event.reason || 'Połączenie z sygnalizacją zostało zamknięte.', true);
-        }
-      };
+      const waiter = { types: expected, resolve, reject, timer: null };
+      waiter.timer = setTimeout(() => {
+        this.waiters = this.waiters.filter((item) => item !== waiter);
+        reject(new Error('request_timeout'));
+      }, REQUEST_TIMEOUT_MS);
+      this.waiters.push(waiter);
     });
   }
 
-  signalSend(message) {
-    const ws = this.session.signaling;
-    if (ws?.readyState === WebSocket.OPEN) ws.send(JSON.stringify(message));
-  }
-
-  handleSignalMessage(message) {
-    if (this.session.role === 'host') {
-      if (message.type === 'offer') this.handleHostOffer(message);
-      if (message.type === 'guest-left') this.removeLobbyGuest(message.guestId);
-      return;
-    }
-
-    if (this.session.role === 'guest') {
-      if (message.type === 'answer') this.acceptAnswer(message);
-      if (message.type === 'rejected') {
-        this.setStatus('lobby', message.reason || 'Gospodarz odrzucił połączenie.', true);
-        safeClose(this.session.guestPc);
-      }
-      if (message.type === 'room-closed' && !this.session.inGame) {
-        this.setStatus('lobby', message.reason || 'Pokój został zamknięty.', true);
-      }
+  settleWaiters(message) {
+    for (const waiter of [...this.waiters]) {
+      if (!waiter.types.has(message.type) && message.type !== 'error') continue;
+      clearTimeout(waiter.timer);
+      this.waiters = this.waiters.filter((item) => item !== waiter);
+      if (message.type === 'error') waiter.reject(new Error(message.code || message.message || 'server_error'));
+      else waiter.resolve(message);
+      break;
     }
   }
 
-  async handleHostOffer(offer) {
-    if (this.session.role !== 'host' || this.session.inGame || !offer?.guestId || !offer?.sdp) return;
-    const checked = validateNick(offer.nick);
-    if (!checked.ok || this.session.signalToSeat.has(offer.guestId)) return;
+  socketSend(payload) {
+    if (this.socket?.readyState !== WebSocket.OPEN) throw new Error('server_offline');
+    this.socket.send(JSON.stringify(payload));
+  }
 
-    const seat = Array.from({ length: this.session.tableSize - 1 }, (_, index) => index + 1)
-      .find((candidate) => !this.session.botSeats.has(candidate) && !this.session.peers.get(candidate)?.connected && !this.session.peers.get(candidate)?.pending);
+  async request(payload, successTypes) {
+    await this.ensureSocket();
+    const waiting = this.addWaiter(successTypes);
+    this.socketSend(payload);
+    return waiting;
+  }
 
-    if (!seat) {
-      this.signalSend({ type: 'reject', guestId: offer.guestId, reason: 'Brak wolnego miejsca przy tym stole.' });
-      return;
-    }
+  ensureSocket() {
+    if (this.socket?.readyState === WebSocket.OPEN) return Promise.resolve(this.socket);
+    if (this.socketPromise) return this.socketPromise;
+    this.intentionalClose = false;
+    this.socketPromise = new Promise((resolve, reject) => {
+      const socket = new WebSocket(WS_URL);
+      this.socket = socket;
+      let greeted = false;
+      const timer = setTimeout(() => { if (!greeted) { try { socket.close(); } catch {} reject(new Error('server_timeout')); } }, REQUEST_TIMEOUT_MS);
+      socket.onmessage = (event) => {
+        const message = safeJsonParse(event.data);
+        if (!message) return;
+        if (message.type === 'hello') {
+          greeted = true;
+          clearTimeout(timer);
+          this.reconnectAttempt = 0;
+          resolve(socket);
+        }
+        this.settleWaiters(message);
+        this.handleServerMessage(message);
+      };
+      socket.onerror = () => { if (!greeted) reject(new Error('server_offline')); };
+      socket.onclose = () => {
+        clearTimeout(timer);
+        if (this.socket === socket) this.socket = null;
+        this.socketPromise = null;
+        this.authSession = null;
+        this.resumeToken = '';
+        for (const waiter of this.waiters.splice(0)) { clearTimeout(waiter.timer); waiter.reject(new Error('connection_closed')); }
+        this.updateNetworkPill();
+        if (!this.intentionalClose && this.loadStoredSession()) this.scheduleReconnect();
+        if (this.session.inGame) this.showDisconnect('Utracono połączenie z serwerem. Trwa automatyczne ponowne łączenie…');
+      };
+    }).finally(() => { this.socketPromise = null; });
+    return this.socketPromise;
+  }
 
-    const pc = new RTCPeerConnection(RTC_CONFIG);
-    const peer = { pc, channel: null, connected: false, pending: true, guestId: offer.guestId, nick: checked.nickname };
-    this.session.peers.set(seat, peer);
-    this.session.signalToSeat.set(offer.guestId, seat);
-    this.session.names[seat] = checked.nickname;
-    pc.ondatachannel = (event) => this.attachHostChannel(seat, event.channel);
-    pc.onconnectionstatechange = () => {
-      if (['failed', 'disconnected', 'closed'].includes(pc.connectionState)) this.networkInterrupted(seat);
-    };
-    this.renderLobby();
+  scheduleReconnect() {
+    if (this.reconnectTimer) return;
+    const delay = Math.min(10000, 700 * Math.pow(1.7, this.reconnectAttempt++));
+    this.reconnectTimer = setTimeout(async () => {
+      this.reconnectTimer = null;
+      try { await this.ensureSocket(); await this.resumeStoredSession(true); }
+      catch { this.scheduleReconnect(); }
+    }, delay);
+  }
 
+  async resumeStoredSession(silent = false) {
+    if (this.authSession) return this.authSession;
+    const stored = this.loadStoredSession();
+    if (!stored) return null;
     try {
-      await pc.setRemoteDescription(offer.sdp);
-      const answer = await pc.createAnswer();
-      await pc.setLocalDescription(answer);
-      await waitForIce(pc);
-      peer.pending = false;
-      this.signalSend({ type: 'answer', guestId: offer.guestId, seat, sdp: pc.localDescription });
-      this.setStatus('lobby', `Łączenie z graczem ${checked.nickname}…`);
-    } catch {
-      this.session.signalToSeat.delete(offer.guestId);
-      this.session.peers.delete(seat);
-      this.session.names[seat] = '';
-      safeClose(pc);
-      this.signalSend({ type: 'reject', guestId: offer.guestId, reason: 'Nie udało się zestawić połączenia WebRTC.' });
-      this.renderLobby();
-    }
-  }
-
-  async acceptAnswer(message) {
-    if (this.session.role !== 'guest' || !this.session.guestPc || !message?.sdp) return;
-    this.session.localSeat = Number(message.seat);
-    this.game.setLocalSeat(this.session.localSeat);
-    try {
-      await this.session.guestPc.setRemoteDescription(message.sdp);
+      await this.ensureSocket();
+      const message = await this.request({ type: 'session.resume', sessionId: stored.sessionId, resumeToken: stored.resumeToken }, 'session.resumed');
+      this.authSession = message.session;
+      this.resumeToken = stored.resumeToken;
+      const room = (message.rooms || []).find((candidate) => candidate.game === GAME_ID);
+      if (room) {
+        this.syncRoom(room);
+        if (room.status === 'in_game') this.socketSend({ type: 'game.state.get', roomId: room.id });
+      }
+      if (!silent) this.restoreName();
+      return this.authSession;
     } catch (error) {
-      this.setStatus('lobby', `Nie udało się przyjąć odpowiedzi gospodarza: ${error.message}`, true);
+      if (/invalid_session_credentials|session_expired/.test(String(error?.message || error))) this.clearStoredSession();
+      throw error;
     }
   }
 
-  attachGuestChannel(channel) {
-    this.session.guestChannel = channel;
-    channel.onopen = () => {
-      this.sendGuest({ type: 'hello', name: this.session.nick });
-      this.signalSend({ type: 'connected' });
-      this.setStatus('lobby', 'Połączono P2P. Czekaj na start gospodarza.');
-      this.updateNetworkPill();
-    };
-    channel.onmessage = (event) => {
-      const message = safeJsonParse(event.data);
-      if (message) this.handleHostData(message);
-    };
-    channel.onclose = () => this.networkInterrupted(0);
-    channel.onerror = () => this.networkInterrupted(0);
+  async ensureSession(rawNickname) {
+    const checked = validateNickname(rawNickname);
+    if (!checked.ok) throw new Error(checked.message);
+    await this.ensureSocket();
+    if (!this.authSession) await this.resumeStoredSession(true).catch(() => null);
+    if (this.authSession?.nickname === checked.nickname) return this.authSession;
+    if (this.authSession && this.session.active) throw new Error('Najpierw opuść bieżący pokój.');
+    if (this.authSession) { this.authSession = null; this.resumeToken = ''; this.clearStoredSession(); }
+    const message = await this.request({ type: 'session.create', nickname: checked.nickname }, 'session.created');
+    this.authSession = message.session;
+    this.resumeToken = message.resumeToken;
+    this.storeSession();
+    this.persistName(checked.nickname);
+    return this.authSession;
   }
 
-  attachHostChannel(seat, channel) {
-    const peer = this.session.peers.get(seat);
-    if (!peer) return;
-    peer.channel = channel;
-    channel.onopen = () => {
-      peer.connected = true;
-      peer.pending = false;
-      this.session.connectedSeats.add(seat);
-      this.sendPeer(seat, this.welcomePacket(seat));
-      this.sendLobby();
+  async createRoom() {
+    try {
+      const nickname = this.el.hostNick?.value || '';
+      await this.ensureSession(nickname);
+      this.pendingTableSize = Number(this.el.tableSize?.querySelector('.active')?.dataset?.mpTableSize) === 4 ? 4 : 3;
+      this.lobbyBotCount = 0;
+      this.setStatus('host', 'Tworzenie pokoju…');
+      const visibility = this.el.visibility?.value === 'private' ? 'private' : 'public';
+      const message = await this.request({ type: 'room.create', game: GAME_ID, name: `Makao · ${this.authSession.nickname}`, visibility }, 'room.created');
+      this.syncRoom(message.room);
+      this.session.tableSize = this.pendingTableSize;
+      this.broadcastLobbyMeta();
       this.renderLobby();
-      this.setStatus('lobby', `${peer.nick} jest połączony.`);
-      this.updateNetworkPill();
-    };
-    channel.onmessage = (event) => {
-      const message = safeJsonParse(event.data);
-      if (message) this.handlePeerData(seat, message);
-    };
-    channel.onclose = () => this.networkInterrupted(seat);
-    channel.onerror = () => this.networkInterrupted(seat);
+      this.setStatus('lobby', visibility === 'public' ? 'Pokój jest widoczny na liście publicznej.' : 'Prywatny pokój gotowy — przekaż kod pozostałym graczom.');
+    } catch (error) { this.setStatus('host', this.errorMessage(error), true); }
   }
 
-  handlePeerData(seat, message) {
-    if (message.type === 'hello') {
-      const checked = validateNick(message.name);
-      if (checked.ok && !this.session.inGame) {
-        this.session.names[seat] = checked.nickname;
-        const peer = this.session.peers.get(seat);
-        if (peer) peer.nick = checked.nickname;
-        this.sendLobby();
-        this.renderLobby();
-      }
+  async joinRoom() {
+    const roomId = normalizeRoomCode(this.el.roomInput?.value);
+    if (!roomId) return this.setStatus('guest', 'Wpisz pełny kod pokoju.', true);
+    return this.joinById(roomId, this.el.guestNick?.value || '');
+  }
+
+  async joinPublicRoom(roomId) { return this.joinById(roomId, this.el.guestNick?.value || this.el.hostNick?.value || ''); }
+
+  async joinById(roomId, nickname) {
+    try {
+      await this.ensureSession(nickname);
+      this.setStatus('guest', 'Dołączanie do pokoju…');
+      const message = await this.request({ type: 'room.join', roomId }, 'room.joined');
+      this.syncRoom(message.room);
+      this.renderLobby();
+      this.setStatus('lobby', 'Połączono ze stołem. Czekaj na start gospodarza.');
+    } catch (error) { this.setStatus('guest', this.errorMessage(error), true); }
+  }
+
+  async refreshRooms() {
+    try {
+      await this.ensureSocket();
+      if (!this.authSession) await this.resumeStoredSession(true).catch(() => null);
+      this.socketSend({ type: 'rooms.list', game: GAME_ID });
+    } catch {
+      if (this.el.roomList) this.el.roomList.innerHTML = '<p class="mp-empty">Serwer jest chwilowo niedostępny.</p>';
+    }
+  }
+
+  reconcileLobbyBots() {
+    const humans = this.session.roomObj?.players?.length || 0;
+    if (humans > this.session.tableSize) this.session.tableSize = humans >= 4 ? 4 : 3;
+    this.lobbyBotCount = Math.max(0, Math.min(this.lobbyBotCount, this.session.tableSize - humans));
+  }
+
+  syncRoom(room) {
+    if (!room || room.game !== GAME_ID) return;
+    this.session.active = true;
+    this.session.room = room.id;
+    this.session.roomObj = room;
+    this.session.localSeat = this.authSession ? room.players.findIndex((player) => player.id === this.authSession.id) : -1;
+    this.session.role = this.authSession?.id === room.ownerSessionId ? 'host' : 'guest';
+    if (room.status === 'in_game') this.session.inGame = true;
+    this.reconcileLobbyBots();
+    this.renderLobby();
+    this.updateNetworkPill();
+  }
+
+  broadcastLobbyMeta() {
+    if (this.session.role !== 'host' || !this.session.room || this.session.inGame || this.socket?.readyState !== WebSocket.OPEN) return;
+    this.socketSend({ type: 'room.send', roomId: this.session.room, payload: { type: 'makao.lobby', tableSize: this.session.tableSize, botCount: this.lobbyBotCount } });
+  }
+
+  applyLobbyMeta(payload) {
+    if (!payload || payload.type !== 'makao.lobby' || this.session.inGame) return;
+    this.session.tableSize = Number(payload.tableSize) === 4 ? 4 : 3;
+    const humans = this.session.roomObj?.players?.length || 0;
+    this.lobbyBotCount = Math.max(0, Math.min(Number(payload.botCount) || 0, this.session.tableSize - humans));
+    this.renderLobby();
+  }
+
+  handleServerMessage(message) {
+    if (!message || typeof message !== 'object') return;
+    if (message.type === 'session.created') {
+      this.authSession = message.session; this.resumeToken = message.resumeToken; this.storeSession(); this.restoreName(); return;
+    }
+    if (message.type === 'session.resumed') {
+      this.authSession = message.session;
+      const room = (message.rooms || []).find((candidate) => candidate.game === GAME_ID);
+      if (room) { this.syncRoom(room); if (room.status === 'in_game') this.socketSend({ type: 'game.state.get', roomId: room.id }); }
       return;
     }
-
-    if (message.type !== 'action' || !this.session.inGame || !GAME_ACTIONS.has(message.action)) return;
-    const result = this.game.executePlayerAction(seat, message.action, message.payload || {});
-    if (!result?.ok) {
-      this.sendPeer(seat, { type: 'error', code: 'ILLEGAL_ACTION', message: result?.reason || 'Niedozwolona akcja.' });
-    }
-  }
-
-  handleHostData(message) {
-    if (message.type === 'welcome') {
-      this.session.localSeat = Number(message.seat);
-      this.session.tableSize = Number(message.tableSize) || 3;
-      this.session.names = [...(message.names || [])];
+    if (['room.created', 'room.joined', 'room.updated'].includes(message.type) && message.room?.game === GAME_ID) { this.syncRoom(message.room); return; }
+    if (message.type === 'room.left' && message.roomId === this.session.room) { this.clearRoomState(); return; }
+    if (message.type === 'room.closed' && message.roomId === this.session.room) { this.showDisconnect('Pokój został zamknięty.'); this.clearRoomState(); return; }
+    if (message.type === 'room.message' && message.roomId === this.session.room) { this.applyLobbyMeta(message.payload); return; }
+    if (message.type === 'rooms.list') { this.rooms = Array.isArray(message.rooms) ? message.rooms : []; this.renderRoomBrowser(); return; }
+    if (message.type === 'game.started' && message.roomId === this.session.room) {
+      if (Number.isInteger(message.seat)) this.session.localSeat = message.seat;
       this.session.botSeats = new Set(message.botSeats || []);
-      this.session.connectedSeats = new Set(message.connectedSeats || []);
-      this.game.setLocalSeat(this.session.localSeat);
-      this.renderLobby();
-      return;
-    }
-
-    if (message.type === 'lobby') {
-      this.session.tableSize = Number(message.tableSize) || this.session.tableSize;
-      this.session.names = [...(message.names || this.session.names)];
-      this.session.botSeats = new Set(message.botSeats || []);
-      this.session.connectedSeats = new Set(message.connectedSeats || []);
-      this.renderLobby();
-      return;
-    }
-
-    if (message.type === 'start') {
       this.session.inGame = true;
+      this.session.authoritative = Boolean(message.authoritative);
+      this.applyPresenceSnapshot(message.presence);
       this.closeModal();
-      this.setStatus('lobby', 'Gra rozpoczęta.');
+      this.ui?.closeMenu?.();
       this.updateNetworkPill();
       return;
     }
-
-    if (message.type === 'state') {
-      const revision = Number(message.revision) || 0;
-      if (revision <= this.session.lastRevision || !message.state) return;
-      this.session.lastRevision = revision;
+    if (message.type === 'game.state' && message.roomId === this.session.room) {
+      if (Number.isInteger(message.viewerSeat)) this.session.localSeat = message.viewerSeat;
+      this.session.botSeats = new Set(message.botSeats || message.state?.botSeats || []);
       this.session.inGame = true;
+      this.session.authoritative = true;
+      this.session.lastRevision = Number(message.revision) || this.session.lastRevision;
+      this.applyPresenceSnapshot(message.presence);
       this.game.applyRemoteState(message.state, this.session.localSeat);
       this.closeModal();
+      this.ui?.closeMenu?.();
       this.updateNetworkPill();
-      if (message.state.networkPaused) this.showDisconnect('Rozgrywka została wstrzymana, ponieważ jeden z graczy utracił połączenie.');
       return;
     }
-
-    if (message.type === 'error') this.ui?.showToast?.(message.message || 'Gospodarz odrzucił akcję.');
-  }
-
-  welcomePacket(seat) {
-    return {
-      type: 'welcome',
-      seat,
-      tableSize: this.session.tableSize,
-      names: this.session.names.slice(0, this.session.tableSize),
-      botSeats: [...this.session.botSeats],
-      connectedSeats: this.connectedHumanSeats(),
-    };
-  }
-
-  sendLobby() {
-    if (this.session.role !== 'host') return;
-    const packet = {
-      type: 'lobby',
-      tableSize: this.session.tableSize,
-      names: this.session.names.slice(0, this.session.tableSize),
-      botSeats: [...this.session.botSeats],
-      connectedSeats: this.connectedHumanSeats(),
-    };
-    this.broadcast(packet);
-  }
-
-  connectedHumanSeats() {
-    const seats = [0];
-    for (let seat = 1; seat < this.session.tableSize; seat += 1) {
-      if (this.session.peers.get(seat)?.connected) seats.push(seat);
+    if (message.type === 'game.presence' && message.roomId === this.session.room) {
+      this.session.botSeats = new Set(message.botSeats || []);
+      this.applyPresenceSnapshot(message.presence);
+      return;
     }
-    return seats;
-  }
-
-  sendPeer(seat, message) {
-    const channel = this.session.peers.get(seat)?.channel;
-    if (channelOpen(channel)) channel.send(JSON.stringify(message));
-  }
-
-  sendGuest(message) {
-    if (channelOpen(this.session.guestChannel)) this.session.guestChannel.send(JSON.stringify(message));
-  }
-
-  broadcast(message) {
-    if (this.session.role !== 'host') return;
-    for (let seat = 1; seat < this.session.tableSize; seat += 1) this.sendPeer(seat, message);
-  }
-
-  handleGameStateChange(state) {
-    if (this.session.role !== 'host' || !this.session.inGame || !state?.started) return;
-    this.session.revision += 1;
-    for (let seat = 1; seat < this.session.tableSize; seat += 1) {
-      const peer = this.session.peers.get(seat);
-      if (!peer?.connected) continue;
-      this.sendPeer(seat, {
-        type: 'state',
-        revision: this.session.revision,
-        state: filterStateForSeat(state, seat),
-      });
+    if (message.type === 'game.player.connection' && message.roomId === this.session.room) {
+      this.session.botSeats = new Set(message.botSeats || [...this.session.botSeats]);
+      if (message.connected) {
+        this.presence.delete(message.seat);
+        this.showDisconnect(`${message.nickname || 'Gracz'} wrócił do gry${message.reclaimedFromBot ? ' i odzyskał miejsce od bota' : ''}.`, true);
+      } else {
+        this.presence.set(message.seat, { phase: 'waiting', nickname: message.nickname || 'Gracz', deadline: Number(message.graceDeadline) || Date.now() + 60000 });
+        this.refreshPresenceNotice();
+      }
+      return;
     }
+    if (message.type === 'game.player.bot_takeover' && message.roomId === this.session.room) {
+      this.session.botSeats = new Set(message.botSeats || []);
+      this.presence.set(message.seat, { phase: 'bot', nickname: message.nickname || 'Gracz', deadline: 0 });
+      this.refreshPresenceNotice();
+      return;
+    }
+    if (message.type === 'error') this.ui?.showToast?.(this.errorMessage({ message: message.code || message.message }));
+  }
+
+  applyPresenceSnapshot(entries) {
+    if (!Array.isArray(entries)) return;
+    const next = new Map();
+    for (const entry of entries) {
+      if (!entry || !Number.isInteger(entry.seat) || entry.sessionId === this.authSession?.id) continue;
+      if (!entry.connected && entry.botActive) next.set(entry.seat, { phase: 'bot', nickname: entry.nickname || 'Gracz', deadline: 0 });
+      else if (!entry.connected && Number.isFinite(entry.graceDeadline)) next.set(entry.seat, { phase: 'waiting', nickname: entry.nickname || 'Gracz', deadline: entry.graceDeadline });
+    }
+    this.presence = next;
+    this.refreshPresenceNotice();
+  }
+
+  refreshPresenceNotice() {
+    clearInterval(this.graceTicker);
+    const values = [...this.presence.values()];
+    if (!values.length) { this.hideDisconnect(); return; }
+    const render = () => {
+      const waiting = values.find((item) => item.phase === 'waiting');
+      const bot = values.find((item) => item.phase === 'bot');
+      if (waiting) {
+        const seconds = Math.max(0, Math.ceil((waiting.deadline - Date.now()) / 1000));
+        this.showDisconnect(`Utracono połączenie z graczem ${waiting.nickname}. Bot przejmie jego miejsce za ${seconds} s.`);
+      } else if (bot) {
+        this.showDisconnect(`Bot przejął miejsce gracza ${bot.nickname} i kontynuuje jego aktualną rękę. Jeśli gracz wróci, przejmie zastany stan.`);
+      }
+    };
+    render();
+    if (values.some((item) => item.phase === 'waiting')) this.graceTicker = setInterval(render, 1000);
   }
 
   handleGameAction(action, payload = {}) {
     if (!this.session.inGame) return { ok: false, reason: 'Multiplayer nie jest aktywny.' };
     if (!GAME_ACTIONS.has(action)) return { ok: false, reason: 'Nieznana akcja.' };
-
-    if (this.session.role === 'host') {
-      const result = this.game.executePlayerAction(this.session.localSeat, action, payload);
-      if (!result?.ok) this.ui?.showToast?.(result?.reason || 'Niedozwolona akcja.');
-      return result;
-    }
-
-    if (this.session.role === 'guest') {
-      if (!channelOpen(this.session.guestChannel)) {
-        const result = { ok: false, reason: 'Brak połączenia z gospodarzem.' };
-        this.ui?.showToast?.(result.reason);
-        return result;
-      }
-      this.sendGuest({ type: 'action', action, payload });
+    try {
+      this.socketSend({ type: 'game.action', roomId: this.session.room, action, payload });
       return { ok: true, pending: true };
+    } catch {
+      return { ok: false, reason: 'Brak połączenia z serwerem.' };
     }
-
-    return { ok: false, reason: 'Nieprawidłowa rola multiplayer.' };
   }
 
-  isGameActive() {
-    return Boolean(this.session.active && this.session.inGame);
-  }
+  isGameActive() { return Boolean(this.session.active && this.session.inGame); }
+  isGuest() { return this.session.role === 'guest'; }
 
-  isGuest() {
-    return this.session.role === 'guest';
-  }
-
-  toggleBotSeat(seat) {
-    if (this.session.role !== 'host' || this.session.inGame || !Number.isInteger(seat) || seat <= 0 || seat >= this.session.tableSize) return;
-    const peer = this.session.peers.get(seat);
-    if (peer?.connected || peer?.pending) return;
-
-    if (this.session.botSeats.has(seat)) {
-      this.session.botSeats.delete(seat);
-      this.session.names[seat] = '';
-    } else {
-      this.session.botSeats.add(seat);
-      this.session.names[seat] = BOT_NAMES[(seat - 1) % BOT_NAMES.length] || `Bot ${seat}`;
-    }
-    this.renderLobby();
-    this.sendLobby();
-  }
-
-  allSeatsReady() {
-    if (this.session.role !== 'host') return false;
-    for (let seat = 1; seat < this.session.tableSize; seat += 1) {
-      if (!seatReady({ seat, tableSize: this.session.tableSize, botSeats: this.session.botSeats, peers: this.session.peers })) return false;
-    }
-    return true;
-  }
-
-  startHostGame() {
-    if (this.session.role !== 'host' || this.session.inGame || !this.allSeatsReady()) return;
-    const seats = Array.from({ length: this.session.tableSize }, (_, index) => ({
-      id: `seat-${index}`,
-      name: this.session.names[index] || (this.session.botSeats.has(index) ? `Bot ${index}` : `Gracz ${index + 1}`),
-      isBot: this.session.botSeats.has(index),
-    }));
-    seats[0].isBot = false;
-
-    this.session.inGame = true;
-    this.session.revision = 0;
-    this.broadcast({ type: 'start' });
-    this.closeModal();
-    this.game.startMultiplayer(seats, { localSeat: 0 });
-    this.signalSend({ type: 'close-room' });
-    this.updateNetworkPill();
+  async startGame() {
+    if (this.session.role !== 'host' || this.session.inGame) return;
+    const humanCount = this.session.roomObj?.players?.length || 0;
+    if (!lobbyReady({ humanCount, botCount: this.lobbyBotCount, tableSize: this.session.tableSize })) return;
+    try {
+      this.socketSend({ type: 'game.start', roomId: this.session.room, botCount: this.lobbyBotCount, settings: { playerCount: this.session.tableSize } });
+      this.setStatus('lobby', 'Uruchamianie gry na serwerze…');
+    } catch (error) { this.setStatus('lobby', this.errorMessage(error), true); }
   }
 
   renderLobby() {
@@ -2386,177 +2159,124 @@ class MakaoMultiplayer {
     this.setView('lobby');
     if (this.el.roomCode) this.el.roomCode.textContent = this.session.room || '—';
     if (!this.el.seats) return;
-
-    const tableSize = this.session.tableSize || 3;
+    const players = this.session.roomObj?.players || [];
+    const humanCount = players.length;
+    this.reconcileLobbyBots();
     const rows = [];
-    for (let seat = 0; seat < tableSize; seat += 1) {
-      const isBot = this.session.botSeats.has(seat);
-      const peer = this.session.peers.get(seat);
-      const isLocal = seat === this.session.localSeat;
-      const connected = seat === 0 || Boolean(peer?.connected) || (this.session.role === 'guest' && this.session.connectedSeats.has(seat));
-      const pending = Boolean(peer?.pending);
-      const name = this.session.names[seat] || (seat === 0 ? 'Gospodarz' : 'Wolne miejsce');
-      const status = isBot ? 'BOT · GOTOWY' : connected ? 'POŁĄCZONY' : pending ? 'ŁĄCZENIE…' : 'OCZEKUJE';
-      const botButton = this.session.role === 'host' && seat > 0 && !connected && !pending
-        ? `<button type="button" class="mp-seat-action" data-mp-bot-seat="${seat}">${isBot ? 'Usuń bota' : 'Dodaj bota'}</button>`
-        : '';
-      rows.push(`<div class="mp-seat ${isLocal ? 'local' : ''} ${isBot ? 'bot' : ''}"><div class="mp-seat-index">${seat + 1}</div><div class="mp-seat-copy"><strong>${this.escapeHtml(name)}${isLocal ? ' · Ty' : ''}</strong><span>${status}</span></div>${botButton}</div>`);
+    for (let seat = 0; seat < this.session.tableSize; seat += 1) {
+      const human = players[seat];
+      const isLocal = human?.id === this.authSession?.id;
+      const isBot = !human && seat < humanCount + this.lobbyBotCount;
+      const connected = Boolean(human?.connected);
+      const name = human?.nickname || (isBot ? BOT_NAMES[(seat - humanCount) % BOT_NAMES.length] || `Bot ${seat + 1}` : 'Wolne miejsce');
+      const status = isBot ? 'BOT · GOTOWY' : connected ? 'POŁĄCZONY' : human ? 'ROZŁĄCZONY' : 'WOLNE';
+      const canEdit = this.session.role === 'host' && !human && !this.session.inGame;
+      const button = canEdit ? `<button type="button" class="mp-seat-action" data-mp-bot-seat="${seat}">${isBot ? 'Usuń bota' : 'Dodaj bota'}</button>` : '';
+      rows.push(`<div class="mp-seat ${isLocal ? 'local' : ''} ${isBot ? 'bot' : ''}"><div class="mp-seat-index">${seat + 1}</div><div class="mp-seat-copy"><strong>${escapeHtml(name)}${isLocal ? ' · Ty' : ''}</strong><span>${status}</span></div>${button}</div>`);
     }
     this.el.seats.innerHTML = rows.join('');
     if (this.el.start) {
       this.el.start.classList.toggle('hidden', this.session.role !== 'host');
-      this.el.start.disabled = !this.allSeatsReady();
+      this.el.start.disabled = !lobbyReady({ humanCount, botCount: this.lobbyBotCount, tableSize: this.session.tableSize });
     }
     this.updateNetworkPill();
   }
 
-  escapeHtml(value) {
-    return String(value || '').replace(/[&<>'"]/g, (char) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', "'": '&#39;', '"': '&quot;' })[char]);
+  renderRoomBrowser() {
+    if (!this.el.roomList) return;
+    const rooms = this.rooms.filter((room) => room.game === GAME_ID && room.visibility === 'public' && room.status !== 'in_game');
+    if (!rooms.length) { this.el.roomList.innerHTML = '<p class="mp-empty">Brak otwartych publicznych pokojów.</p>'; return; }
+    this.el.roomList.innerHTML = rooms.map((room) => {
+      const count = room.players?.length || 0;
+      return `<article class="mp-room-item"><div><strong>${escapeHtml(room.name || 'Makao')}</strong><span>${count}/4 graczy · ${escapeHtml(room.id)}</span></div><button class="btn ghost compact" type="button" data-room-id="${escapeHtml(room.id)}">Dołącz</button></article>`;
+    }).join('');
   }
 
   async copyRoomCode() {
     if (!this.session.room) return;
-    try {
-      await navigator.clipboard.writeText(this.session.room.replace('-', ''));
-      this.ui?.showToast?.('Kod pokoju skopiowany.');
-    } catch {
-      this.ui?.showToast?.(`Kod pokoju: ${this.session.room}`);
-    }
+    try { await navigator.clipboard.writeText(this.session.room); this.ui?.showToast?.('Kod pokoju skopiowany.'); }
+    catch { this.ui?.showToast?.(`Kod pokoju: ${this.session.room}`); }
   }
 
-  removeLobbyGuest(guestId) {
-    const seat = this.session.signalToSeat.get(guestId);
-    if (!Number.isInteger(seat)) return;
-    const peer = this.session.peers.get(seat);
-    safeClose(peer?.channel);
-    safeClose(peer?.pc);
-    this.session.signalToSeat.delete(guestId);
-    this.session.peers.delete(seat);
-    this.session.connectedSeats.delete(seat);
-    if (!this.session.botSeats.has(seat)) this.session.names[seat] = '';
-    this.renderLobby();
-    this.sendLobby();
-  }
-
-  networkInterrupted(seat) {
-    if (this.intentionalClose || !this.session.active) return;
-    if (this.session.role === 'host' && seat > 0 && !this.session.inGame) {
-      const peer = this.session.peers.get(seat);
-      if (peer?.guestId) this.removeLobbyGuest(peer.guestId);
-      return;
-    }
-
-    if (this.session.inGame) {
-      if (this.session.role === 'host' && !this.game.state.networkPaused) {
-        this.game.state.networkPaused = true;
-        this.game.addLog('Rozgrywka została wstrzymana: gracz utracił połączenie.');
-        this.game.emit();
-      } else if (this.session.role === 'guest' && this.game.state?.started) {
-        this.game.state.networkPaused = true;
-        this.game.emit();
-      }
-      this.showDisconnect(this.session.role === 'guest'
-        ? 'Połączenie z gospodarzem zostało przerwane. Rozgrywka nie będzie kontynuowana z niespójnym stanem.'
-        : 'Jeden z graczy utracił połączenie. Rozgrywka została wstrzymana, aby zachować spójny stan.');
-    }
-    this.updateNetworkPill();
-  }
-
-  showDisconnect(message) {
+  showDisconnect(message, transient = false) {
     if (this.el.disconnectText) this.el.disconnectText.textContent = message;
     this.el.disconnect?.classList.add('open');
+    if (transient) setTimeout(() => { if (![...this.presence.values()].length) this.hideDisconnect(); }, 2800);
   }
 
-  hideDisconnect() {
-    this.el.disconnect?.classList.remove('open');
-  }
+  hideDisconnect() { this.el.disconnect?.classList.remove('open'); }
 
-  leaveRoom() {
-    if (this.session.role === 'host' && !this.session.inGame) this.signalSend({ type: 'close-room' });
-    if (this.session.role === 'guest' && !this.session.inGame) this.signalSend({ type: 'leave' });
-    this.closeNetworkResources();
-    this.session = this.emptySession();
+  async leaveRoom() {
+    if (this.session.room && this.socket?.readyState === WebSocket.OPEN) {
+      try { this.socketSend({ type: 'room.leave', roomId: this.session.room }); } catch {}
+    }
+    this.clearRoomState();
     this.game.stop();
     this.hideDisconnect();
     this.closeModal();
     this.ui?.openMenu?.();
-    this.updateNetworkPill();
   }
 
-  closeNetworkResources() {
-    this.intentionalClose = true;
-    for (const peer of this.session.peers?.values?.() || []) {
-      safeClose(peer.channel);
-      safeClose(peer.pc);
-    }
-    safeClose(this.session.guestChannel);
-    safeClose(this.session.guestPc);
-    safeClose(this.session.signaling);
-    this.intentionalClose = false;
+  clearRoomState() {
+    this.session = this.emptySession();
+    this.lobbyBotCount = 0;
+    this.presence.clear();
+    clearInterval(this.graceTicker);
+    this.hideDisconnect();
+    this.updateNetworkPill();
   }
 
   updateNetworkPill() {
     if (!this.el.pill) return;
     if (!this.session.active) {
-      this.el.pill.textContent = 'OFFLINE';
-      this.el.pill.classList.remove('online', 'warning');
+      this.el.pill.textContent = this.socket?.readyState === WebSocket.OPEN ? 'ONLINE · GOTOWY' : 'OFFLINE';
+      this.el.pill.classList.toggle('online', this.socket?.readyState === WebSocket.OPEN);
+      this.el.pill.classList.remove('warning');
       return;
     }
-    if (this.game.state?.networkPaused) {
-      this.el.pill.textContent = 'P2P · WSTRZYMANO';
+    if (this.presence.size) {
+      this.el.pill.textContent = 'ONLINE · ZMIANA GRACZA';
       this.el.pill.classList.remove('online');
       this.el.pill.classList.add('warning');
       return;
     }
-    if (this.session.inGame) {
-      this.el.pill.textContent = `P2P · ${this.session.role === 'host' ? 'HOST' : `MIEJSCE ${this.session.localSeat + 1}`}`;
-      this.el.pill.classList.add('online');
-      this.el.pill.classList.remove('warning');
-      return;
-    }
-    this.el.pill.textContent = 'P2P · LOBBY';
+    this.el.pill.textContent = this.session.inGame ? `ONLINE · MIEJSCE ${this.session.localSeat + 1}` : 'ONLINE · LOBBY';
     this.el.pill.classList.add('online');
     this.el.pill.classList.remove('warning');
   }
 
+  errorMessage(error) {
+    const code = String(error?.message || error || 'Błąd połączenia');
+    const messages = {
+      server_offline: 'Nie udało się połączyć ze wspólnym serwerem QQND.', request_timeout: 'Serwer nie odpowiedział na czas.',
+      room_full: 'Pokój jest pełny.', room_not_found: 'Pokój nie istnieje.', invalid_player_count: 'Stół wymaga 3 albo 4 miejsc.',
+      not_your_turn: 'Teraz nie jest Twoja tura.', seat_controlled_by_bot: 'To miejsce jest obecnie sterowane przez bota.',
+      card_not_owned: 'Nie masz tej karty.', illegal_play: 'Ta karta nie jest teraz legalna.',
+    };
+    return messages[code] || code.replaceAll('_', ' ');
+  }
+
   debug() {
     return {
-      active: this.session.active,
-      role: this.session.role,
-      room: this.session.room,
-      localSeat: this.session.localSeat,
-      tableSize: this.session.tableSize,
-      botSeats: [...this.session.botSeats],
-      connectedSeats: this.connectedHumanSeats(),
-      inGame: this.session.inGame,
-      revision: this.session.revision,
-      lastRevision: this.session.lastRevision,
+      active: this.session.active, room: this.session.room, role: this.session.role, localSeat: this.session.localSeat,
+      tableSize: this.session.tableSize, lobbyBotCount: this.lobbyBotCount, botSeats: [...this.session.botSeats],
+      inGame: this.session.inGame, authoritative: this.session.authoritative, revision: this.session.lastRevision,
     };
   }
 
-  debugSetBotSeat(seat, enabled = true) {
-    if (this.session.role !== 'host') return false;
-    if (enabled && !this.session.botSeats.has(seat)) this.toggleBotSeat(seat);
-    if (!enabled && this.session.botSeats.has(seat)) this.toggleBotSeat(seat);
-    return this.session.botSeats.has(seat) === enabled;
-  }
-
   debugHostLobby({ tableSize = 4, botSeats = [2, 3], connectedSeats = [1] } = {}) {
-    this.closeNetworkResources();
+    this.authSession = { id: 'debug-host', nickname: 'Host' };
     this.session = this.emptySession();
     this.session.active = true;
     this.session.role = 'host';
     this.session.localSeat = 0;
     this.session.room = 'TEST-ROOM';
-    this.session.nick = 'Host';
     this.session.tableSize = tableSize === 3 ? 3 : 4;
-    this.session.names[0] = 'Host';
-    this.session.botSeats = new Set(botSeats.filter((seat) => seat > 0 && seat < this.session.tableSize));
-    for (const seat of connectedSeats) {
-      if (seat <= 0 || seat >= this.session.tableSize || this.session.botSeats.has(seat)) continue;
-      this.session.names[seat] = `Guest ${seat}`;
-      this.session.peers.set(seat, { connected: true, pending: false, pc: null, channel: null, guestId: `debug-${seat}` });
-    }
+    this.session.roomObj = {
+      id: 'TEST-ROOM', game: GAME_ID, ownerSessionId: 'debug-host', status: 'waiting', visibility: 'private',
+      players: [{ id: 'debug-host', nickname: 'Host', connected: true }, ...connectedSeats.map((seat) => ({ id: `debug-${seat}`, nickname: `Guest ${seat}`, connected: true }))],
+    };
+    this.lobbyBotCount = Math.min(botSeats.length, this.session.tableSize - this.session.roomObj.players.length);
     this.openModal();
     this.renderLobby();
     return this.debug();
@@ -3219,17 +2939,42 @@ function prepareFlight(element, from, to, rotation, size = null) {
 }
 
 // ===== js/main.js =====
+const theme = document.createElement('link');
+theme.rel = 'stylesheet';
+theme.href = './css/cardroom-refresh.css?v=20260911-1';
+document.head.appendChild(theme);
+
 let ui;
 let multiplayer;
 const game = new MakaoGame({
-  onChange: (state) => {
-    ui?.render(state);
-    multiplayer?.handleGameStateChange(state);
-  },
+  onChange: (state) => ui?.render(state),
   onMessage: (message) => ui?.showToast(message),
 });
 
 multiplayer = new MakaoMultiplayer(game);
+
+// Runtime bot ownership is fresher than a seat projection during the exact
+// reconnect/takeover boundary. Apply it before the existing UI model sees the
+// snapshot so a reclaimed human seat is interactive immediately.
+const applyRemoteState = game.applyRemoteState.bind(game);
+game.applyRemoteState = (view, localSeat) => {
+  const botSeats = multiplayer?.session?.botSeats;
+  const normalized = view && Array.isArray(view.players) && botSeats instanceof Set
+    ? {
+        ...view,
+        botCount: botSeats.size,
+        botSeats: [...botSeats],
+        players: view.players.map((player, index) => ({
+          ...player,
+          isBot: botSeats.has(index),
+          isHuman: !botSeats.has(index),
+          isLocal: index === localSeat,
+        })),
+      }
+    : view;
+  return applyRemoteState(normalized, localSeat);
+};
+
 ui = new MakaoUI(game, multiplayer);
 multiplayer.attachUI(ui);
 installUxEffects(game, ui);
