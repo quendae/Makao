@@ -1,68 +1,88 @@
-# Wdrożenie multiplayera P2P Makao
+# Wdrożenie multiplayera Makao — QQND Card Room
 
-Gra i sygnalizacja są wdrażane oddzielnie. Pliki gry pozostają zwykłym statycznym frontendem, a `cloudflare-signaling/` obsługuje wyłącznie utworzenie pokoju i wymianę SDP potrzebnego do WebRTC.
+Makao korzysta ze wspólnego backendu `quendae/qqnd-game-server`. Frontend pozostaje statyczny, a cała rozgrywka online jest **server-authoritative**.
 
-> Konfiguracja `wrangler.jsonc` używa przykładowej docelowej domeny `makao.qqnd.fyi`. Jeżeli Makao jest publikowane pod innym hostem, zmień tylko `routes[].pattern` na `<twoj-host>/api/*`. Frontend domyślnie korzysta z `/api` na tym samym originie.
+- API: `https://api.qqnd.fyi`
+- WebSocket: `wss://api.qqnd.fyi/api/v1/ws`
+- frontend: `https://makao.qqnd.fyi/`
+- game id: `makao`
+- oficjalny online: 3 albo 4 miejsca
 
-## 1. Frontend
+## Kolejność wdrożenia
 
-Wdróż zawartość repozytorium na serwer WWW przez HTTPS. Produkcyjny multiplayer wymaga bezpiecznego originu; tryb offline działa niezależnie od Workera.
+**Najpierw backend, potem frontend.** Frontend z tej migracji wymaga adaptera Makao w `qqnd-game-server`.
 
-Jeżeli używasz wersji modułowej, serwer musi udostępnić `index.html`, `css/` i `js/`. Wersja `makao-single.html` również zawiera moduł multiplayera po wygenerowaniu, ale po otwarciu przez `file://` pozostaje praktycznie trybem offline.
-
-## 2. Cloudflare Worker
+Backend:
 
 ```bash
-cd cloudflare-signaling
+cd /opt/qqnd-game-server
+git pull
 npm install
-npx wrangler login
-npm run deploy
+npm run typecheck
+npm test
+npm run build
+systemctl restart qqnd-game-server
+systemctl status qqnd-game-server --no-pager
+curl https://api.qqnd.fyi/api/v1/health
 ```
 
-Worker używa Durable Object `SignalingRoom`. Pokój żyje maksymalnie 30 minut i może przyjąć do trzech gości, dzięki czemu host + 3 gości tworzą stół czteroosobowy.
+Smoke WebSocket:
 
-## 3. Trasa
-
-Dla domeny z przykładowej konfiguracji Worker przejmuje tylko:
-
-```text
-makao.qqnd.fyi/api/*
+```bash
+npx wscat -c wss://api.qqnd.fyi/api/v1/ws
 ```
 
-`/`, `/index.html`, CSS i JavaScript nadal obsługuje zwykły serwer WWW. Dzięki temu awaria sygnalizacji nie blokuje startu gry offline.
-
-## 4. Test po wdrożeniu
-
-Otwórz:
-
-```text
-https://makao.qqnd.fyi/api/health
-```
-
-Oczekiwana odpowiedź:
+Pierwsza ramka powinna być podobna do:
 
 ```json
-{"ok":true,"service":"makao-signaling"}
+{"type":"hello","protocol":1,"service":"qqnd-game-server"}
 ```
 
-Następnie otwórz grę na dwóch urządzeniach/przeglądarkach:
+## Frontend
 
-1. host: Multiplayer → Utwórz stół → wpisz nick → utwórz pokój;
-2. guest: Multiplayer → Dołącz → wpisz ten sam kod i ewentualne hasło;
-3. sprawdź, czy gość pojawia się na stabilnym miejscu w lobby;
-4. opcjonalnie włącz boty na wolnych miejscach;
-5. rozpocznij grę.
+Wyczyść poprzedni runtime Makao na serwerze statycznym i skopiuj wyłącznie pliki z `DEPLOY_RUNTIME.md`. Produkcyjny entry point to `index.html`.
 
-Po uruchomieniu partii Worker zamyka pokój sygnalizacyjny. Dalsze wiadomości gry idą przez WebRTC DataChannel.
+Po wdrożeniu wykonaj hard refresh; jeśli stary JS/CSS nadal jest serwowany, wyczyść cache reverse proxy/CDN.
 
-## 5. Model bezpieczeństwa
+## Model multiplayera
 
-Gość nie wysyła pełnego stanu gry. Wysyła jedynie akcję, np. identyfikatory kart do zagrania. Host przypisuje akcję do miejsca wynikającego z konkretnego DataChannel, waliduje ją i dopiero wtedy zmienia stan.
+Klient tworzy albo wznawia anonimową sesję przez `session.create` / `session.resume`. Resume token jest przechowywany lokalnie i nie powinien być logowany.
 
-Host wysyła każdemu gościowi osobny widok. Cudze ręce oraz kolejność talii są usuwane przed wysłaniem — nie są tylko ukrywane przez CSS.
+Lobby wspiera:
 
-To model przeznaczony do prywatnych gier. Host nadal posiada cały stan i teoretycznie może go podejrzeć. Odporna na oszustwa gra rankingowa wymagałaby przeniesienia autorytetu na zaufany serwer.
+- pokoje publiczne widoczne na liście,
+- pokoje prywatne dostępne kodem,
+- stoły 3- i 4-osobowe,
+- uzupełnianie wolnych miejsc botami przed startem.
 
-## 6. Sieci restrykcyjne
+Po starcie przeglądarka wysyła wyłącznie intencje jako `game.action`. Serwer posiada talię, ręce, pending effects, wybory J/A, legalność ruchów, boty i wynik/klasyfikację. Klient nie wysyła `game.state.commit` ani `game.state.publish`.
 
-Konfiguracja klienta używa publicznego STUN. Typowe domowe połączenia powinny zestawić P2P, ale restrykcyjne NAT/firewall mogą wymagać w przyszłości serwera TURN. TURN nie zmienia modelu host-authoritative — jedynie przekazuje zaszyfrowany ruch WebRTC, gdy bezpośrednia ścieżka nie jest dostępna.
+## Disconnect / takeover
+
+Podczas aktywnej gry odłączenie człowieka nie usuwa jego miejsca:
+
+1. przez 60 s seat i aktualna ręka pozostają zarezerwowane;
+2. po timeout bot przejmuje **ten sam seat i zastany stan**;
+3. jeżeli człowiek wróci później przez `session.resume`, odbiera miejsce botowi;
+4. rozgrywka nie jest cofana — gracz dostaje stan pozostawiony przez bota.
+
+UI pokazuje stały centralny komunikat podczas grace period oraz po przejęciu miejsca przez bota.
+
+## Test po wdrożeniu
+
+Przetestuj co najmniej:
+
+1. `/` zwraca 200 i ładuje CSS/JS;
+2. public room create/list/join;
+3. private room create/join kodem;
+4. 3 ludzi;
+5. 4 ludzi;
+6. człowiek + bot fill do 3/4 miejsc;
+7. legalny ruch i odrzucenie nielegalnego ruchu;
+8. disconnect krótszy niż 60 s i resume tego samego seat;
+9. disconnect dłuższy niż 60 s, takeover bota i późny reconnect/reclaim;
+10. cudze ręce oraz kolejność draw pile nie pojawiają się w snapshotach klienta.
+
+## Legacy Cloudflare/WebRTC
+
+Nowy runtime nie używa `cloudflare-signaling/`, `RTCPeerConnection`, STUN ani SDP. Katalog legacy pozostaje chwilowo w repozytorium wyłącznie jako rollback do czasu zakończenia live smoke. Po odbiorze produkcyjnym należy go usunąć osobnym cleanup commitem i poprawić `npm run check`, aby nie sprawdzał Workera.
