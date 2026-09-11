@@ -16,6 +16,29 @@ const game = new MakaoGame({
 });
 
 multiplayer = new MakaoMultiplayer(game);
+
+// Runtime bot ownership is fresher than a seat projection during the exact
+// reconnect/takeover boundary. Apply it before the existing UI model sees the
+// snapshot so a reclaimed human seat is interactive immediately.
+const applyRemoteState = game.applyRemoteState.bind(game);
+game.applyRemoteState = (view, localSeat) => {
+  const botSeats = multiplayer?.session?.botSeats;
+  const normalized = view && Array.isArray(view.players) && botSeats instanceof Set
+    ? {
+        ...view,
+        botCount: botSeats.size,
+        botSeats: [...botSeats],
+        players: view.players.map((player, index) => ({
+          ...player,
+          isBot: botSeats.has(index),
+          isHuman: !botSeats.has(index),
+          isLocal: index === localSeat,
+        })),
+      }
+    : view;
+  return applyRemoteState(normalized, localSeat);
+};
+
 ui = new MakaoUI(game, multiplayer);
 multiplayer.attachUI(ui);
 installUxEffects(game, ui);
