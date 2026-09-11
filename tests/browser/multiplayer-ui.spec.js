@@ -14,6 +14,15 @@ for (const viewport of VIEWPORTS) {
     await expect(page.locator('#multiplayer-btn')).toBeVisible();
     await expect(page.locator('#multiplayer-btn strong')).toContainText('Multiplayer online');
 
+    const loadedTheme = await page.evaluate(() => [...document.styleSheets].some((sheet) => sheet.href?.includes('cardroom-refresh.css')));
+    expect(loadedTheme).toBe(true);
+    const multiplayerButtonStyle = await page.locator('#multiplayer-btn').evaluate((element) => {
+      const style = getComputedStyle(element);
+      return { display: style.display, radius: style.borderRadius };
+    });
+    expect(multiplayerButtonStyle.display).not.toBe('none');
+    expect(multiplayerButtonStyle.radius).not.toBe('0px');
+
     await page.evaluate(() => window.makaoMultiplayer.debugHostLobby({
       tableSize: 4,
       connectedSeats: [1],
@@ -27,15 +36,6 @@ for (const viewport of VIEWPORTS) {
     await expect(page.locator('#mp-seats .mp-seat.bot')).toHaveCount(2);
     await expect(page.locator('#mp-start-game')).toBeEnabled();
     await expect(page.locator('#mp-leave-room')).toBeVisible();
-
-    const cardStyle = await page.locator('.card-face').first().evaluate((element) => {
-      const style = getComputedStyle(element);
-      return { radius: style.borderRadius, background: style.backgroundImage };
-    }).catch(() => null);
-    if (cardStyle) {
-      expect(cardStyle.radius).not.toBe('0px');
-      expect(cardStyle.background).toContain('linear-gradient');
-    }
 
     const overflow = await page.evaluate(() => ({
       document: document.documentElement.scrollWidth - document.documentElement.clientWidth,
