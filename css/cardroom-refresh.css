@@ -21,7 +21,7 @@
   box-shadow: inset 0 0 0 2px rgba(255,222,161,.16), 0 0 80px rgba(0,0,0,.48);
 }
 .menu-card {
-  width: min(540px, calc(100vw - 54px));
+  width: min(520px, calc(100vw - 54px));
   padding: 32px 38px 28px;
   border: 1px solid rgba(239,215,145,.24);
   border-radius: 24px;
@@ -58,9 +58,56 @@
   transition: transform .14s ease, filter .14s ease, border-color .14s ease;
 }
 .menu-action:hover { filter: brightness(1.10); transform: translateY(-1px); }
+.menu-action strong { font-weight: 800; }
+.menu-action > span:last-child { color: #d8c58c; font-size: 24px; font-weight: 500; }
 .primary-menu { color:#231c0b; border-color:transparent; background:linear-gradient(180deg,#e7cd78,#bd9137); }
 .multiplayer-menu { border-color: rgba(78,190,132,.38) !important; }
 .motion-toggle { margin-top: 15px; }
+
+/* Duren-style second step for a new offline session. */
+.offline-setup-overlay { z-index: 70; }
+.offline-setup-card {
+  width: min(560px, calc(100vw - 32px));
+  padding: 24px;
+  text-align: left;
+  border-color: rgba(239,215,145,.24);
+  background: linear-gradient(160deg,#1b2d24,#09120d);
+  box-shadow: 0 30px 90px rgba(0,0,0,.62), inset 0 1px rgba(255,255,255,.06);
+}
+.offline-setup-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 18px;
+}
+.offline-setup-head h2 { margin: 4px 0 0; font: 800 28px/1.1 Georgia,serif; }
+.offline-setup-head .inline-close {
+  position: static;
+  flex: 0 0 auto;
+  width: 38px;
+  height: 38px;
+}
+.offline-setup-lead { margin: 14px 0 18px; color: var(--muted,#97aa9f); line-height: 1.5; }
+.offline-setup-section {
+  display: grid;
+  grid-template-columns: minmax(0,1fr) minmax(190px,230px);
+  align-items: center;
+  gap: 18px;
+  padding: 16px;
+  border: 1px solid rgba(255,255,255,.08);
+  border-radius: 14px;
+  background: rgba(255,255,255,.025);
+}
+.offline-setup-section b { display:block; font-size:14px; }
+.offline-setup-section small { display:block; margin-top:5px; color:var(--muted,#97aa9f); line-height:1.4; }
+.offline-setup-section .segmented { margin:0; }
+.offline-setup-actions {
+  display:flex;
+  justify-content:flex-end;
+  gap:9px;
+  margin-top:18px;
+}
+.offline-setup-actions .btn { min-width:132px; }
 
 /* ---------- Cards ---------- */
 .card-face {
@@ -116,14 +163,13 @@
 .mini-back { width: 42px; height: 59px; border-width: 2px; border-radius: 7px; }
 
 .ux-arriving-card { animation: cardroomDealIn .50s cubic-bezier(.16,.78,.26,1) both; }
-.discard-slot .table-card { animation: cardroomDrop .28s cubic-bezier(.2,.8,.3,1) both; }
+/* Played cards land through the flight overlay. The real discard node must not
+   replay a second drop animation or flash under the moving card. */
+.discard-slot .table-card,
+.discard-slot .table-card.ux-settled-card { animation: none !important; }
 @keyframes cardroomDealIn {
   from { opacity:0; transform:translateY(-160px) scale(.62) rotate(-9deg); }
   to { opacity:1; transform:translateY(var(--drop,0)) rotate(var(--angle,0)) scale(1); }
-}
-@keyframes cardroomDrop {
-  from { opacity:.18; transform:translateY(-48px) scale(.88) rotate(6deg); }
-  to { opacity:1; transform:translateY(0) scale(1) rotate(0); }
 }
 .reduce-motion .ux-arriving-card,
 .reduce-motion .discard-slot .table-card { animation:none !important; }
@@ -205,6 +251,10 @@
 @media (max-width: 620px) {
   .overlay-frame { width:calc(100% - 16px); height:calc(100% - 16px); border-width:7px; }
   .menu-card { width:min(520px,calc(100vw - 30px)); }
+  .offline-setup-card { padding:20px; }
+  .offline-setup-section { grid-template-columns:1fr; gap:12px; }
+  .offline-setup-actions { display:grid; grid-template-columns:1fr 1fr; }
+  .offline-setup-actions .btn { min-width:0; }
   .mp-browser-head { align-items:flex-start; }
   .mp-room-item { grid-template-columns:1fr; }
   .mp-room-item .btn { width:100%; }
@@ -219,6 +269,10 @@
   .menu-section { margin:8px 0; padding:8px 10px; }
   .menu-action { min-height:42px; margin-top:6px; }
   .motion-toggle { margin-top:8px; }
+  .offline-setup-card { max-height:calc(100vh - 20px); overflow:auto; padding:16px 20px; }
+  .offline-setup-lead { margin:8px 0 10px; font-size:11px; }
+  .offline-setup-section { padding:10px 12px; }
+  .offline-setup-actions { margin-top:10px; }
   .mp-room-list { max-height:110px; }
   .disconnect-overlay.open { padding-top:58px; }
 }

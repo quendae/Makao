@@ -2,10 +2,11 @@ import { MakaoGame } from './game.js';
 import { MakaoMultiplayer } from './multiplayer.js';
 import { MakaoUI } from './ui.js';
 import { installUxEffects } from './ux-effects.js';
+import { installCardroomUi } from './cardroom-ui.js';
 
 const theme = document.createElement('link');
 theme.rel = 'stylesheet';
-theme.href = './css/cardroom-refresh.css?v=20260911-1';
+theme.href = './css/cardroom-refresh.css?v=20260911-2';
 document.head.appendChild(theme);
 
 let ui;
@@ -41,6 +42,7 @@ game.applyRemoteState = (view, localSeat) => {
 
 ui = new MakaoUI(game, multiplayer);
 multiplayer.attachUI(ui);
+installCardroomUi(ui, game, multiplayer);
 installUxEffects(game, ui);
 ui.render(game.state);
 

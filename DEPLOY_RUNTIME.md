@@ -14,6 +14,7 @@ js/bot.js
 js/game.js
 js/multiplayer.js
 js/ui.js
+js/cardroom-ui.js
 js/ux-effects.js
 js/main.js
 ```
@@ -45,6 +46,7 @@ Sprawdź przez HTTPS:
 /css/multiplayer.css
 /css/cardroom-refresh.css
 /js/main.js
+/js/cardroom-ui.js
 /js/multiplayer.js
 ```
 
