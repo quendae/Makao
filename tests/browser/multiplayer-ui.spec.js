@@ -62,3 +62,67 @@ test('multiplayer entry exposes server room browser and public/private room choi
   await expect(page.locator('#mp-visibility')).toBeVisible();
   await expect(page.locator('#mp-host-password')).toBeHidden();
 });
+
+test('closing multiplayer returns to the main menu instead of an idle table', async ({ page }) => {
+  await page.goto('/');
+  await page.locator('#multiplayer-btn').click();
+  await expect(page.locator('#main-menu')).not.toHaveClass(/open/);
+  await page.locator('#mp-close').click();
+  await expect(page.locator('#multiplayer-modal')).not.toHaveClass(/open/);
+  await expect(page.locator('#main-menu')).toHaveClass(/open/);
+});
+
+test('offline bot count lives in a second-step new game dialog', async ({ page }) => {
+  await page.goto('/');
+  await expect(page.locator('#bot-selector')).toBeHidden();
+  await page.locator('#start-btn').click();
+  await expect(page.locator('#offline-setup-modal')).toHaveClass(/open/);
+  await expect(page.locator('#bot-selector')).toBeVisible();
+  await page.locator('#bot-selector [data-bots="3"]').click();
+  await page.locator('#offline-start-btn').click();
+  await expect(page.locator('#offline-setup-modal')).not.toHaveClass(/open/);
+  await expect(page.locator('#main-menu')).not.toHaveClass(/open/);
+  await expect.poll(() => page.evaluate(() => window.makaoGame.state.players.length)).toBe(4);
+});
+
+test('rendering an unchanged state preserves discard and hand card DOM nodes', async ({ page }) => {
+  await page.goto('/');
+  const stable = await page.evaluate(() => {
+    window.makaoGame.start(2);
+    document.getElementById('main-menu')?.classList.remove('open');
+    const discardBefore = document.querySelector('#discard-pile .table-card');
+    const handBefore = document.querySelector('#human-hand .hand-card');
+    const handId = handBefore?.dataset.cardId;
+    window.makaoGame.onChange(window.makaoGame.state);
+    const discardAfter = document.querySelector('#discard-pile .table-card');
+    const handAfter = handId ? document.querySelector(`#human-hand [data-card-id="${handId}"]`) : null;
+    return {
+      hasDiscard: Boolean(discardBefore),
+      hasHand: Boolean(handBefore),
+      sameDiscard: discardBefore === discardAfter,
+      sameHand: handBefore === handAfter,
+    };
+  });
+  expect(stable.hasDiscard).toBe(true);
+  expect(stable.hasHand).toBe(true);
+  expect(stable.sameDiscard).toBe(true);
+  expect(stable.sameHand).toBe(true);
+});
+
+test('played card flight straightens to zero rotation at the discard pile', async ({ page }) => {
+  await page.goto('/');
+  await page.evaluate(() => {
+    window.makaoGame.start(2);
+    document.getElementById('main-menu')?.classList.remove('open');
+  });
+
+  const playable = page.locator('#human-hand .hand-card.playable').first();
+  await expect(playable).toBeVisible();
+  await playable.click();
+  await page.locator('#play-btn').click();
+
+  const flight = page.locator('.ux-flight-card.is-flying').first();
+  await expect(flight).toBeVisible();
+  const transform = await flight.evaluate((element) => element.style.transform);
+  expect(transform).toContain('rotate(0deg)');
+});
