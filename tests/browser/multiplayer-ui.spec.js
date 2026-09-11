@@ -133,6 +133,10 @@ test('played card stays single during flight and straightens at the discard pile
   expect(playedId).toBeTruthy();
   await playable.click();
   await page.locator('#play-btn').click();
+  await page.evaluate(() => {
+    clearTimeout(window.makaoGame.timer);
+    window.makaoGame.timer = null;
+  });
 
   const flight = page.locator('.ux-flight-card.is-flying').first();
   await expect(flight).toBeVisible();
