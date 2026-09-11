@@ -10,7 +10,10 @@ const VIEWPORTS = [
 for (const viewport of VIEWPORTS) {
   test(`multiplayer lobby stays usable on ${viewport.name}`, async ({ page }) => {
     await page.setViewportSize({ width: viewport.width, height: viewport.height });
-    await page.goto('/index.html');
+    await page.goto('/');
+    await expect(page.locator('#multiplayer-btn')).toBeVisible();
+    await expect(page.locator('#multiplayer-btn strong')).toContainText('Multiplayer online');
+
     await page.evaluate(() => window.makaoMultiplayer.debugHostLobby({
       tableSize: 4,
       connectedSeats: [1],
@@ -21,8 +24,18 @@ for (const viewport of VIEWPORTS) {
     await expect(modal).toHaveClass(/open/);
     await expect(page.locator('#mp-room-code-display')).toContainText('TEST-ROOM');
     await expect(page.locator('#mp-seats .mp-seat')).toHaveCount(4);
+    await expect(page.locator('#mp-seats .mp-seat.bot')).toHaveCount(2);
     await expect(page.locator('#mp-start-game')).toBeEnabled();
     await expect(page.locator('#mp-leave-room')).toBeVisible();
+
+    const cardStyle = await page.locator('.card-face').first().evaluate((element) => {
+      const style = getComputedStyle(element);
+      return { radius: style.borderRadius, background: style.backgroundImage };
+    }).catch(() => null);
+    if (cardStyle) {
+      expect(cardStyle.radius).not.toBe('0px');
+      expect(cardStyle.background).toContain('linear-gradient');
+    }
 
     const overflow = await page.evaluate(() => ({
       document: document.documentElement.scrollWidth - document.documentElement.clientWidth,
@@ -39,3 +52,13 @@ for (const viewport of VIEWPORTS) {
     }
   });
 }
+
+test('multiplayer entry exposes server room browser and public/private room choice', async ({ page }) => {
+  await page.goto('/');
+  await page.locator('#multiplayer-btn').click();
+  await expect(page.locator('#mp-title')).toContainText('QQND Card Room');
+  await expect(page.locator('#mp-room-browser')).toBeVisible();
+  await page.locator('#mp-choose-host').click();
+  await expect(page.locator('#mp-visibility')).toBeVisible();
+  await expect(page.locator('#mp-host-password')).toBeHidden();
+});
