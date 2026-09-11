@@ -6,6 +6,7 @@ on:
     paths:
       - 'index.html'
       - 'css/multiplayer.css'
+      - 'css/cardroom-refresh.css'
       - 'js/game.js'
       - 'js/multiplayer.js'
       - 'js/ui.js'
@@ -21,6 +22,7 @@ on:
     paths:
       - 'index.html'
       - 'css/multiplayer.css'
+      - 'css/cardroom-refresh.css'
       - 'js/game.js'
       - 'js/multiplayer.js'
       - 'js/ui.js'
