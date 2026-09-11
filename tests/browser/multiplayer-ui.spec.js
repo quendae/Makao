@@ -133,7 +133,7 @@ test('full-size cards keep one geometry from hand through flight to discard', as
 
   const handSize = await size('#human-hand .hand-card');
   const discardSize = await size('#discard-pile .table-card');
-  const drawSize = await size('#draw-pile .card-back');
+  const drawSize = await size('#draw-pile');
   expect(discardSize).toEqual(handSize);
   expect(drawSize).toEqual(handSize);
 
