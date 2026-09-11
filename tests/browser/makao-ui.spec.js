@@ -109,7 +109,7 @@ test('Jack choice exposes only held 5-10 ranks plus Nic and does not cover hand'
   });
 
   await expect(page.locator('#choice-modal')).toHaveClass(/open/);
-  await expect(page.locator('#choice-options .no-demand-choice')).toHaveCount(1);
+  await expect(page.locator('#choice-options .choice-none')).toHaveCount(1);
   const labels = await page.locator('#choice-options .choice-button').allTextContents();
   const joined = labels.map((text) => text.replace(/\s+/g, ' ').trim());
   expect(joined.some((text) => text.startsWith('5'))).toBe(true);
@@ -198,8 +198,12 @@ test('browser agent plays complete games through real DOM handlers without layou
         motion.checked = false;
         motion.dispatchEvent(new Event('change', { bubbles: true }));
       }
-      document.querySelector(`[data-bots="${bots}"]`).click();
+
+      // The current Duren-style menu starts an offline game in two steps:
+      // open setup, choose bot count, then confirm.
       document.getElementById('start-btn').click();
+      document.querySelector(`[data-bots="${bots}"]`).click();
+      document.getElementById('offline-start-btn').click();
 
       const game = window.makaoGame;
       const sleep = () => new Promise((resolve) => setTimeout(resolve, 3));
@@ -226,7 +230,7 @@ test('browser agent plays complete games through real DOM handlers without layou
 
         if (player?.isHuman && game.state.pendingChoice) {
           const choice = game.state.pendingChoice.type === 'jack'
-            ? document.querySelector('#choice-options .no-demand-choice') ?? document.querySelector('#choice-options .choice-button')
+            ? document.querySelector('#choice-options .choice-none') ?? document.querySelector('#choice-options .choice-button')
             : document.querySelector('#choice-options .choice-button');
           if (!choice) return { ok: false, problem: `no choice button for ${game.state.pendingChoice.type}`, ticks, turnNumber: game.state.turnNumber };
           choice.click();
