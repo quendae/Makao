@@ -12,7 +12,7 @@ for (const viewport of VIEWPORTS) {
     await page.setViewportSize({ width: viewport.width, height: viewport.height });
     await page.goto('/');
     await expect(page.locator('#multiplayer-btn')).toBeVisible();
-    await expect(page.locator('#multiplayer-btn strong')).toContainText('Multiplayer online');
+    await expect(page.locator('#multiplayer-btn strong')).toContainText('Gra online');
 
     const loadedTheme = await page.evaluate(() => [...document.styleSheets].some((sheet) => sheet.href?.includes('cardroom-refresh.css')));
     expect(loadedTheme).toBe(true);
@@ -74,7 +74,9 @@ test('closing multiplayer returns to the main menu instead of an idle table', as
 
 test('offline bot count lives in a second-step new game dialog', async ({ page }) => {
   await page.goto('/');
-  await expect(page.locator('#bot-selector')).toBeHidden();
+  await expect(page.locator('#main-menu #bot-selector')).toHaveCount(0);
+  await expect(page.locator('#start-btn strong')).toContainText('Nowa gra offline');
+  await expect(page.locator('#multiplayer-btn strong')).toContainText('Gra online');
   await page.locator('#start-btn').click();
   await expect(page.locator('#offline-setup-modal')).toHaveClass(/open/);
   await expect(page.locator('#bot-selector')).toBeVisible();
@@ -89,6 +91,10 @@ test('rendering an unchanged state preserves discard and hand card DOM nodes', a
   await page.goto('/');
   const stable = await page.evaluate(() => {
     window.makaoGame.start(2);
+    clearTimeout(window.makaoGame.timer);
+    window.makaoGame.timer = null;
+    window.makaoGame.state.currentIndex = 0;
+    window.makaoGame.onChange(window.makaoGame.state);
     document.getElementById('main-menu')?.classList.remove('open');
     const discardBefore = document.querySelector('#discard-pile .table-card');
     const handBefore = document.querySelector('#human-hand .hand-card');
@@ -109,20 +115,31 @@ test('rendering an unchanged state preserves discard and hand card DOM nodes', a
   expect(stable.sameHand).toBe(true);
 });
 
-test('played card flight straightens to zero rotation at the discard pile', async ({ page }) => {
+test('played card stays single during flight and straightens at the discard pile', async ({ page }) => {
   await page.goto('/');
   await page.evaluate(() => {
     window.makaoGame.start(2);
+    clearTimeout(window.makaoGame.timer);
+    window.makaoGame.timer = null;
+    window.makaoGame.state.currentIndex = 0;
+    window.makaoGame.onChange(window.makaoGame.state);
     document.getElementById('main-menu')?.classList.remove('open');
   });
 
+  const oldDiscardId = await page.locator('#discard-pile .table-card').getAttribute('data-card-id');
   const playable = page.locator('#human-hand .hand-card.playable').first();
   await expect(playable).toBeVisible();
+  const playedId = await playable.getAttribute('data-card-id');
+  expect(playedId).toBeTruthy();
   await playable.click();
   await page.locator('#play-btn').click();
 
   const flight = page.locator('.ux-flight-card.is-flying').first();
   await expect(flight).toBeVisible();
+  await expect(page.locator('#discard-pile .table-card')).toHaveAttribute('data-card-id', oldDiscardId);
   const transform = await flight.evaluate((element) => element.style.transform);
   expect(transform).toContain('rotate(0deg)');
+
+  await expect(flight).toHaveCount(0);
+  await expect(page.locator('#discard-pile .table-card')).toHaveAttribute('data-card-id', playedId);
 });
